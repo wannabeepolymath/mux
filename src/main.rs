@@ -3,13 +3,20 @@ mod client;
 mod config;
 mod dispatch;
 mod error;
+mod forward;
 mod protocol;
+mod server;
 mod types;
+
+use std::sync::Arc;
 
 use clap::Parser;
 use config::{CliArgs, Config};
+use dispatch::Dispatcher;
+use tokio::net::TcpListener;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = CliArgs::parse();
     let config = match Config::from_cli(args) {
         Ok(c) => c,
@@ -30,20 +37,33 @@ fn main() {
     tracing::info!("  listen: {}", config.listen_addr);
     tracing::info!("  metrics: {}", config.metrics_addr);
     tracing::info!(
-        "  backends: {:?}",
+        "  backends: {}",
         config
             .backend_addrs
             .iter()
             .map(|a| a.to_string())
             .collect::<Vec<_>>()
+            .join(", ")
     );
     tracing::info!("  hang_timeout: {:?}", config.hang_timeout);
-    tracing::info!("  circuit_threshold: {}", config.circuit_threshold);
-    tracing::info!("  circuit_cooldown: {:?}", config.circuit_cooldown);
+    tracing::info!("  max_retries: {}", config.max_retries);
     tracing::info!("  max_queue_depth: {}", config.max_queue_depth);
     tracing::info!("  max_streams_per_conn: {}", config.max_streams_per_conn);
-    tracing::info!("  max_retries: {}", config.max_retries);
 
-    // TODO: Phase 3+ — start the tokio runtime and run the server
-    tracing::info!("Configuration validated. Server not yet implemented.");
+    let config = Arc::new(config);
+
+    let listener = match TcpListener::bind(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to bind {}: {e}", config.listen_addr);
+            std::process::exit(1);
+        }
+    };
+
+    let dispatcher = Dispatcher::new(config.clone());
+    let dispatch_tx = dispatcher.sender();
+
+    tokio::spawn(dispatcher.run());
+
+    server::run_server(listener, dispatch_tx, config).await;
 }
