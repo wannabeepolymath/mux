@@ -8,10 +8,13 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::backend::circuit::CircuitState;
 use crate::backend::connection::BackendConn;
 use crate::backend::state::BackendState;
 use crate::config::Config;
 use crate::forward::{self, ForwardOutcome, ForwardResult};
+use crate::health::{BackendHealth, HealthSnapshot};
+use crate::metrics::Metrics;
 use crate::protocol::client::ServerMessage;
 use crate::types::{BackendId, StreamId};
 
@@ -28,6 +31,8 @@ pub enum DispatchEvent {
     BackendRecovered(BackendId),
     /// A client cancelled a stream.
     CancelStream { stream_id: StreamId },
+    /// Health endpoint requested a snapshot of the dispatcher's state.
+    QueryHealth(oneshot::Sender<HealthSnapshot>),
     /// Graceful shutdown.
     Shutdown,
 }
@@ -68,6 +73,7 @@ pub enum ClientEvent {
 
 pub struct Dispatcher {
     config: Arc<Config>,
+    metrics: Arc<Metrics>,
     backends: Vec<BackendConn>,
     queue: queue::BoundedQueue<PendingRequest>,
     dispatch_tx: mpsc::Sender<DispatchEvent>,
@@ -79,10 +85,10 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, metrics: Arc<Metrics>) -> Self {
         let (tx, rx) = mpsc::channel(256);
 
-        let backends = config
+        let backends: Vec<BackendConn> = config
             .backend_addrs
             .iter()
             .enumerate()
@@ -100,10 +106,15 @@ impl Dispatcher {
             })
             .collect();
 
+        for backend in &backends {
+            metrics.set_backend_state(&backend.addr.to_string(), backend.state.name());
+        }
+
         let queue = queue::BoundedQueue::new(config.max_queue_depth);
 
         Self {
             config,
+            metrics,
             backends,
             queue,
             dispatch_tx: tx,
@@ -129,6 +140,9 @@ impl Dispatcher {
                 DispatchEvent::StreamCompleted(result) => self.handle_stream_completed(result),
                 DispatchEvent::BackendRecovered(id) => self.handle_backend_recovered(id),
                 DispatchEvent::CancelStream { stream_id } => self.handle_cancel(&stream_id),
+                DispatchEvent::QueryHealth(reply) => {
+                    let _ = reply.send(self.snapshot());
+                }
                 DispatchEvent::Shutdown => {
                     tracing::info!("dispatcher shutting down");
                     break;
@@ -158,6 +172,10 @@ impl Dispatcher {
 
         if let Err(req) = self.queue.push_back(req) {
             req.active_count.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .requests_total
+                .with_label_values(&["error"])
+                .inc();
             let err = ServerMessage::Error {
                 stream_id: req.stream_id.0.clone(),
                 message: format!(
@@ -170,6 +188,7 @@ impl Dispatcher {
             return;
         }
 
+        self.metrics.queue_depth.set(self.queue.len() as i64);
         self.try_dispatch();
     }
 
@@ -187,6 +206,12 @@ impl Dispatcher {
                 rtf: _,
                 ..
             } => {
+                self.metrics.ttfc_seconds.observe(ttfc.as_secs_f64());
+                self.metrics
+                    .requests_total
+                    .with_label_values(&["success"])
+                    .inc();
+
                 let backend = &mut self.backends[backend_idx];
                 backend.scoring.record_ttfc(ttfc.as_secs_f64() * 1000.0);
                 backend.scoring.record_result(true);
@@ -194,7 +219,10 @@ impl Dispatcher {
                 backend.state = BackendState::Ready {
                     since: Instant::now(),
                 };
+                self.metrics
+                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
+                self.metrics.active_streams.set(self.active_streams as i64);
 
                 let elapsed = result.created_at.elapsed();
                 let total_time = elapsed.as_secs_f64();
@@ -236,7 +264,10 @@ impl Dispatcher {
                 // Don't mark Ready immediately — cooldown prevents retries
                 // hitting the same (possibly still-hung) backend.
                 backend.state = BackendState::Disconnected;
+                self.metrics
+                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
+                self.metrics.active_streams.set(self.active_streams as i64);
 
                 let dispatch_tx = self.dispatch_tx.clone();
                 let bid = result.backend_id;
@@ -262,6 +293,10 @@ impl Dispatcher {
                 );
 
                 if result.retries_remaining > 0 {
+                    self.metrics
+                        .requests_total
+                        .with_label_values(&["retry"])
+                        .inc();
                     let mut tried = result.tried_backends;
                     if !tried.contains(&result.backend_id) {
                         tried.push(result.backend_id);
@@ -278,7 +313,12 @@ impl Dispatcher {
                         tried_backends: tried,
                     };
                     let _ = self.queue.push_front(retry);
+                    self.metrics.queue_depth.set(self.queue.len() as i64);
                 } else {
+                    self.metrics
+                        .requests_total
+                        .with_label_values(&["error"])
+                        .inc();
                     result.active_count.fetch_sub(1, Ordering::Relaxed);
                     let err = ServerMessage::Error {
                         stream_id: result.stream_id.0.clone(),
@@ -298,7 +338,10 @@ impl Dispatcher {
                 backend.state = BackendState::Ready {
                     since: Instant::now(),
                 };
+                self.metrics
+                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
+                self.metrics.active_streams.set(self.active_streams as i64);
                 result.active_count.fetch_sub(1, Ordering::Relaxed);
                 tracing::debug!(
                     stream = %result.stream_id,
@@ -315,7 +358,10 @@ impl Dispatcher {
                 backend.state = BackendState::Ready {
                     since: Instant::now(),
                 };
+                self.metrics
+                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
+                self.metrics.active_streams.set(self.active_streams as i64);
                 result.active_count.fetch_sub(1, Ordering::Relaxed);
                 tracing::debug!(
                     stream = %result.stream_id,
@@ -334,6 +380,8 @@ impl Dispatcher {
             backend.state = BackendState::Ready {
                 since: Instant::now(),
             };
+            self.metrics
+                .set_backend_state(&backend.addr.to_string(), backend.state.name());
             tracing::debug!(backend = %backend_id, "backend recovered after cooldown");
             self.try_dispatch();
         }
@@ -350,6 +398,7 @@ impl Dispatcher {
         // Otherwise, try removing from the queue.
         if let Some(req) = self.queue.remove_by_stream_id(stream_id) {
             req.active_count.fetch_sub(1, Ordering::Relaxed);
+            self.metrics.queue_depth.set(self.queue.len() as i64);
             tracing::debug!(stream = %stream_id, "cancelled queued request");
         }
     }
@@ -389,21 +438,27 @@ impl Dispatcher {
                 .remove_at(idx)
                 .expect("peeked just above, must exist");
 
+            self.metrics.queue_depth.set(self.queue.len() as i64);
             self.dispatch_to(backend_id, req);
             // Element shifted into our slot; don't increment idx.
         }
     }
 
     fn dispatch_to(&mut self, backend_id: BackendId, req: PendingRequest) {
+        let backend_addr_str = self.backends[backend_id.0].addr.to_string();
         self.backends[backend_id.0].state = BackendState::Busy {
             since: Instant::now(),
             stream_id: req.stream_id.clone(),
         };
+        self.metrics
+            .set_backend_state(&backend_addr_str, self.backends[backend_id.0].state.name());
         self.active_streams += 1;
+        self.metrics.active_streams.set(self.active_streams as i64);
 
         let backend_addr = self.backends[backend_id.0].addr;
         let dispatch_tx = self.dispatch_tx.clone();
         let hang_timeout = self.config.hang_timeout;
+        let metrics = self.metrics.clone();
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
         self.in_flight.insert(req.stream_id.clone(), cancel_tx);
@@ -421,6 +476,7 @@ impl Dispatcher {
                 req,
                 hang_timeout,
                 cancel_rx,
+                metrics,
             )
             .await;
             let _ = dispatch_tx
@@ -479,4 +535,37 @@ impl Dispatcher {
 
         best.map(|(id, _)| id)
     }
+
+    /// Build a snapshot of the dispatcher's state for the /health endpoint.
+    fn snapshot(&self) -> HealthSnapshot {
+        let backends = self
+            .backends
+            .iter()
+            .map(|b| BackendHealth {
+                addr: b.addr.to_string(),
+                state: b.state.name().to_string(),
+                ttfc_ewma_ms: round_2(b.scoring.ttfc_ewma_ms()),
+                error_rate: round_2(b.scoring.error_rate()),
+                total_requests: b.scoring.total_requests,
+                consecutive_failures: b.circuit.consecutive_failures(),
+                circuit: match b.circuit.state() {
+                    CircuitState::Closed => "closed".to_string(),
+                    CircuitState::Open => "open".to_string(),
+                    CircuitState::HalfOpen => "half_open".to_string(),
+                },
+            })
+            .collect();
+
+        HealthSnapshot {
+            status: "ok",
+            backends,
+            queue_depth: self.queue.len(),
+            active_streams: self.active_streams,
+            active_connections: self.metrics.active_connections.get(),
+        }
+    }
+}
+
+fn round_2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }

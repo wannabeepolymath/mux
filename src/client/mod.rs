@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::Config;
 use crate::dispatch::{ClientEvent, DispatchEvent, PendingRequest};
+use crate::metrics::Metrics;
 use crate::protocol::client::ClientMessage;
 use crate::types::StreamId;
 
@@ -20,8 +21,10 @@ pub async fn handle_client(
     ws: WebSocketStream<TcpStream>,
     dispatch_tx: mpsc::Sender<DispatchEvent>,
     config: Arc<Config>,
+    metrics: Arc<Metrics>,
     client_addr: std::net::SocketAddr,
 ) {
+    metrics.inc_active_connections();
     let (ws_sink, mut ws_stream) = ws.split();
     let (client_tx, client_rx) = mpsc::channel::<ClientEvent>(64);
 
@@ -128,6 +131,7 @@ pub async fn handle_client(
 
     drop(client_tx);
     let _ = writer_handle.await;
+    metrics.dec_active_connections();
     tracing::debug!(client = %client_addr, "client handler finished");
 }
 

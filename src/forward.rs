@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::dispatch::{ClientEvent, PendingRequest};
+use crate::metrics::Metrics;
 use crate::protocol::backend::BackendMessage;
 use crate::protocol::frame::encode_binary_frame;
 use crate::types::{BackendId, StreamId};
@@ -55,6 +56,7 @@ pub async fn run_forwarding(
     request: PendingRequest,
     hang_timeout: Duration,
     cancel_rx: oneshot::Receiver<()>,
+    metrics: Arc<Metrics>,
 ) -> ForwardResult {
     let stream_id = request.stream_id.clone();
 
@@ -66,6 +68,7 @@ pub async fn run_forwarding(
         &request.client_tx,
         hang_timeout,
         cancel_rx,
+        &metrics,
     )
     .await;
 
@@ -92,6 +95,7 @@ async fn do_forward(
     client_tx: &mpsc::Sender<ClientEvent>,
     hang_timeout: Duration,
     mut cancel_rx: oneshot::Receiver<()>,
+    metrics: &Arc<Metrics>,
 ) -> ForwardOutcome {
     let url = format!("ws://{}/v1/ws/speech", backend_addr);
     let connect_timeout = Duration::from_secs(3);
@@ -176,8 +180,14 @@ async fn do_forward(
                             }
                             total_bytes += data.len();
 
+                            let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
-                            if send_to_client(client_tx, ClientEvent::Binary(tagged)).is_err() {
+                            let send_result =
+                                send_to_client(client_tx, ClientEvent::Binary(tagged));
+                            metrics
+                                .chunk_forward_seconds
+                                .observe(chunk_start.elapsed().as_secs_f64());
+                            if send_result.is_err() {
                                 return ForwardOutcome::ClientGone;
                             }
                         }

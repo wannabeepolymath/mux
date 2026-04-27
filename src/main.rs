@@ -4,6 +4,8 @@ mod config;
 mod dispatch;
 mod error;
 mod forward;
+mod health;
+mod metrics;
 mod protocol;
 mod server;
 mod types;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use clap::Parser;
 use config::{CliArgs, Config};
 use dispatch::Dispatcher;
+use metrics::Metrics;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -52,6 +55,14 @@ async fn main() {
 
     let config = Arc::new(config);
 
+    let metrics = match Metrics::new() {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            tracing::error!("failed to create metrics: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let listener = match TcpListener::bind(config.listen_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -60,10 +71,16 @@ async fn main() {
         }
     };
 
-    let dispatcher = Dispatcher::new(config.clone());
+    let dispatcher = Dispatcher::new(config.clone(), metrics.clone());
     let dispatch_tx = dispatcher.sender();
 
     tokio::spawn(dispatcher.run());
 
-    server::run_server(listener, dispatch_tx, config).await;
+    tokio::spawn(health::run_http_server(
+        config.metrics_addr,
+        dispatch_tx.clone(),
+        metrics.clone(),
+    ));
+
+    server::run_server(listener, dispatch_tx, config, metrics).await;
 }
