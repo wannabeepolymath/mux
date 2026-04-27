@@ -19,9 +19,6 @@ pub enum ForwardOutcome {
     Success {
         ttfc: Duration,
         audio_duration: f64,
-        total_time: f64,
-        rtf: f64,
-        total_bytes: usize,
     },
     BackendCrashed,
     BackendHung,
@@ -39,7 +36,6 @@ pub struct ForwardResult {
     pub client_tx: mpsc::Sender<ClientEvent>,
     pub text: String,
     pub speaker_id: u32,
-    pub priority: u32,
     pub retries_remaining: u32,
     pub created_at: Instant,
     pub active_count: Arc<AtomicUsize>,
@@ -79,7 +75,6 @@ pub async fn run_forwarding(
         client_tx: request.client_tx,
         text: request.text,
         speaker_id: request.speaker_id,
-        priority: request.priority,
         retries_remaining: request.retries_remaining,
         created_at: request.created_at,
         active_count: request.active_count,
@@ -133,7 +128,6 @@ async fn do_forward(
 
     let request_start = Instant::now();
     let mut first_chunk_time: Option<Instant> = None;
-    let mut total_bytes: usize = 0;
 
     loop {
         tokio::select! {
@@ -178,7 +172,6 @@ async fn do_forward(
                             if first_chunk_time.is_none() {
                                 first_chunk_time = Some(Instant::now());
                             }
-                            total_bytes += data.len();
 
                             let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
@@ -194,13 +187,8 @@ async fn do_forward(
                         Message::Text(text_data) => {
                             let backend_msg = BackendMessage::from_text(&text_data);
                             match backend_msg {
-                                BackendMessage::Queued { .. } => {}
-                                BackendMessage::Done {
-                                    audio_duration,
-                                    total_time,
-                                    rtf,
-                                    ..
-                                } => {
+                                BackendMessage::Queued => {}
+                                BackendMessage::Done { audio_duration } => {
                                     let ttfc = first_chunk_time
                                         .map(|t| t.duration_since(request_start))
                                         .unwrap_or_default();
@@ -208,9 +196,6 @@ async fn do_forward(
                                     return ForwardOutcome::Success {
                                         ttfc,
                                         audio_duration,
-                                        total_time,
-                                        rtf,
-                                        total_bytes,
                                     };
                                 }
                                 BackendMessage::Error { message } => {
@@ -219,7 +204,6 @@ async fn do_forward(
                                 BackendMessage::Unknown(raw) => {
                                     return ForwardOutcome::MalformedResponse(raw);
                                 }
-                                BackendMessage::AudioData(_) => {}
                             }
                         }
                         Message::Close(_) => {

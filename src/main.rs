@@ -2,7 +2,6 @@ mod backend;
 mod client;
 mod config;
 mod dispatch;
-mod error;
 mod forward;
 mod health;
 mod metrics;

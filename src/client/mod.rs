@@ -1,5 +1,3 @@
-pub mod stream;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -24,7 +22,7 @@ pub async fn handle_client(
     metrics: Arc<Metrics>,
     client_addr: std::net::SocketAddr,
 ) {
-    metrics.inc_active_connections();
+    metrics.active_connections.inc();
     let (ws_sink, mut ws_stream) = ws.split();
     let (client_tx, client_rx) = mpsc::channel::<ClientEvent>(64);
 
@@ -64,7 +62,6 @@ pub async fn handle_client(
                         stream_id,
                         text,
                         speaker_id,
-                        priority,
                     } => {
                         let current = active_count.load(Ordering::Relaxed);
                         if current >= config.max_streams_per_conn {
@@ -87,7 +84,6 @@ pub async fn handle_client(
                             stream_id: StreamId(stream_id),
                             text,
                             speaker_id,
-                            priority,
                             client_tx: client_tx.clone(),
                             retries_remaining: config.max_retries,
                             created_at: Instant::now(),
@@ -131,7 +127,7 @@ pub async fn handle_client(
 
     drop(client_tx);
     let _ = writer_handle.await;
-    metrics.dec_active_connections();
+    metrics.active_connections.dec();
     tracing::debug!(client = %client_addr, "client handler finished");
 }
 

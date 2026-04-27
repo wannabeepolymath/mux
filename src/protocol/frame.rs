@@ -18,47 +18,22 @@ pub fn encode_binary_frame(stream_id: &str, pcm_payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
-/// Decode a binary frame from the client (or for testing).
-/// Returns (stream_id, pcm_payload).
-pub fn decode_binary_frame(data: &[u8]) -> Result<(&str, &[u8]), FrameError> {
-    if data.is_empty() {
-        return Err(FrameError::Empty);
-    }
-
-    let id_len = data[0] as usize;
-    if data.len() < 1 + id_len {
-        return Err(FrameError::TooShort {
-            need: 1 + id_len,
-            got: data.len(),
-        });
-    }
-
-    let stream_id =
-        std::str::from_utf8(&data[1..1 + id_len]).map_err(|_| FrameError::InvalidUtf8)?;
-    let pcm = &data[1 + id_len..];
-
-    Ok((stream_id, pcm))
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum FrameError {
-    #[error("empty binary frame")]
-    Empty,
-    #[error("frame too short: need {need} bytes, got {got}")]
-    TooShort { need: usize, got: usize },
-    #[error("stream_id is not valid UTF-8")]
-    InvalidUtf8,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(data: &[u8]) -> (&str, &[u8]) {
+        let id_len = data[0] as usize;
+        let sid = std::str::from_utf8(&data[1..1 + id_len]).unwrap();
+        let pcm = &data[1 + id_len..];
+        (sid, pcm)
+    }
 
     #[test]
     fn roundtrip() {
         let pcm = vec![0u8; 1024];
         let encoded = encode_binary_frame("stream-42", &pcm);
-        let (sid, payload) = decode_binary_frame(&encoded).unwrap();
+        let (sid, payload) = parse(&encoded);
         assert_eq!(sid, "stream-42");
         assert_eq!(payload.len(), 1024);
     }
@@ -66,29 +41,26 @@ mod tests {
     #[test]
     fn empty_stream_id() {
         let encoded = encode_binary_frame("", &[1, 2, 3]);
-        let (sid, payload) = decode_binary_frame(&encoded).unwrap();
+        let (sid, payload) = parse(&encoded);
         assert_eq!(sid, "");
         assert_eq!(payload, &[1, 2, 3]);
     }
 
     #[test]
-    fn empty_frame_error() {
-        let result = decode_binary_frame(&[]);
-        assert!(matches!(result, Err(FrameError::Empty)));
-    }
-
-    #[test]
-    fn truncated_frame_error() {
-        // id_len says 10 but only 3 bytes total
-        let result = decode_binary_frame(&[10, 0, 0]);
-        assert!(matches!(result, Err(FrameError::TooShort { .. })));
-    }
-
-    #[test]
     fn empty_payload() {
         let encoded = encode_binary_frame("s1", &[]);
-        let (sid, payload) = decode_binary_frame(&encoded).unwrap();
+        let (sid, payload) = parse(&encoded);
         assert_eq!(sid, "s1");
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn header_layout() {
+        let encoded = encode_binary_frame("ab", &[0xff, 0xee]);
+        // 1 byte id_len, 2 bytes id, 2 bytes payload
+        assert_eq!(encoded.len(), 5);
+        assert_eq!(encoded[0], 2);
+        assert_eq!(&encoded[1..3], b"ab");
+        assert_eq!(&encoded[3..5], &[0xff, 0xee]);
     }
 }

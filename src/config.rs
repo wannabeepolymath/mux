@@ -30,10 +30,6 @@ pub struct CliArgs {
     #[arg(long, default_value = "30")]
     pub circuit_cooldown_secs: u64,
 
-    /// Max buffer bytes per stream before dropping chunks
-    #[arg(long, default_value = "262144")]
-    pub max_buffer_bytes: usize,
-
     /// Max global queue depth
     #[arg(long, default_value = "64")]
     pub max_queue_depth: usize,
@@ -55,7 +51,6 @@ pub struct Config {
     pub hang_timeout: Duration,
     pub circuit_threshold: u32,
     pub circuit_cooldown: Duration,
-    pub max_buffer_bytes: usize,
     pub max_queue_depth: usize,
     pub max_streams_per_conn: usize,
     pub max_retries: u32,
@@ -79,7 +74,6 @@ impl Config {
             hang_timeout: Duration::from_secs(args.hang_timeout_secs),
             circuit_threshold: args.circuit_threshold,
             circuit_cooldown: Duration::from_secs(args.circuit_cooldown_secs),
-            max_buffer_bytes: args.max_buffer_bytes,
             max_queue_depth: args.max_queue_depth,
             max_streams_per_conn: args.max_streams_per_conn,
             max_retries: args.max_retries,

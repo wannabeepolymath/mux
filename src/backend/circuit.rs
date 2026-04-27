@@ -11,16 +11,6 @@ pub enum CircuitState {
     HalfOpen,
 }
 
-impl CircuitState {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Closed => "closed",
-            Self::Open => "open",
-            Self::HalfOpen => "half_open",
-        }
-    }
-}
-
 /// Tracks consecutive failures and manages circuit state transitions.
 #[derive(Debug)]
 pub struct CircuitBreaker {

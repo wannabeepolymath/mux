@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use prometheus::{
     Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
@@ -32,8 +29,11 @@ pub struct Metrics {
 
     /// Number of connected client WebSocket sessions.
     pub active_connections: IntGauge,
-    pub active_connections_counter: Arc<AtomicUsize>,
 }
+
+/// All states a backend can be in. The metrics endpoint emits a gauge for each
+/// (addr, state) pair so consumers can count by state in queries.
+const BACKEND_STATES: [&str; 3] = ["ready", "busy", "disconnected"];
 
 impl Metrics {
     pub fn new() -> Result<Self, prometheus::Error> {
@@ -98,29 +98,18 @@ impl Metrics {
             active_streams,
             backend_state,
             active_connections,
-            active_connections_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    pub fn inc_active_connections(&self) {
-        let n = self.active_connections_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        self.active_connections.set(n as i64);
-    }
-
-    pub fn dec_active_connections(&self) {
-        let n = self
-            .active_connections_counter
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-        self.active_connections.set(n as i64);
-    }
-
-    /// Publish state for a single backend: set the active state gauge to 1
-    /// and all others to 0.
+    /// Publish state for a single backend: set the gauge for `current_state`
+    /// to 1 and all other states to 0.
     pub fn set_backend_state(&self, backend_label: &str, current_state: &str) {
-        for state in &["ready", "busy", "connecting", "draining", "disconnected"] {
+        for state in &BACKEND_STATES {
             let value = if *state == current_state { 1 } else { 0 };
-            if let Ok(g) = self.backend_state.get_metric_with_label_values(&[backend_label, state]) {
+            if let Ok(g) = self
+                .backend_state
+                .get_metric_with_label_values(&[backend_label, state])
+            {
                 g.set(value);
             }
         }

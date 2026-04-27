@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-/// Messages sent from Client -> Multiplexer
+/// Messages sent from Client -> Multiplexer.
+///
+/// Additional fields in the wire JSON (e.g. `priority`) are ignored.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -9,17 +11,11 @@ pub enum ClientMessage {
         text: String,
         #[serde(default)]
         speaker_id: u32,
-        #[serde(default = "default_priority")]
-        priority: u32,
     },
     Cancel {
         stream_id: String,
     },
     Close,
-}
-
-fn default_priority() -> u32 {
-    10
 }
 
 /// Messages sent from Multiplexer -> Client (text frames)
@@ -53,7 +49,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_start_message() {
+    fn parse_start_message_with_priority_ignored() {
         let json = r#"{"type":"start","stream_id":"s1","text":"Hello","speaker_id":0,"priority":10}"#;
         let msg: ClientMessage = serde_json::from_str(json).unwrap();
         match msg {
@@ -61,12 +57,10 @@ mod tests {
                 stream_id,
                 text,
                 speaker_id,
-                priority,
             } => {
                 assert_eq!(stream_id, "s1");
                 assert_eq!(text, "Hello");
                 assert_eq!(speaker_id, 0);
-                assert_eq!(priority, 10);
             }
             _ => panic!("expected Start"),
         }

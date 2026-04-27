@@ -33,8 +33,6 @@ pub enum DispatchEvent {
     CancelStream { stream_id: StreamId },
     /// Health endpoint requested a snapshot of the dispatcher's state.
     QueryHealth(oneshot::Sender<HealthSnapshot>),
-    /// Graceful shutdown.
-    Shutdown,
 }
 
 // ── Request types ───────────────────────────────────────────────────────
@@ -43,14 +41,13 @@ pub struct PendingRequest {
     pub stream_id: StreamId,
     pub text: String,
     pub speaker_id: u32,
-    pub priority: u32,
     pub client_tx: mpsc::Sender<ClientEvent>,
     pub retries_remaining: u32,
     pub created_at: Instant,
     /// Shared counter for active streams on the client connection.
     /// Decremented by the dispatcher when the stream reaches a terminal state.
     pub active_count: Arc<AtomicUsize>,
-    /// Backends that have already been tried for this request (to avoid retrying same one).
+    /// Backends already tried for this request (to avoid retrying the same one).
     pub tried_backends: Vec<BackendId>,
 }
 
@@ -99,9 +96,7 @@ impl Dispatcher {
                     config.circuit_threshold,
                     config.circuit_cooldown,
                 );
-                conn.state = BackendState::Ready {
-                    since: Instant::now(),
-                };
+                conn.state = BackendState::Ready;
                 conn
             })
             .collect();
@@ -142,10 +137,6 @@ impl Dispatcher {
                 DispatchEvent::CancelStream { stream_id } => self.handle_cancel(&stream_id),
                 DispatchEvent::QueryHealth(reply) => {
                     let _ = reply.send(self.snapshot());
-                }
-                DispatchEvent::Shutdown => {
-                    tracing::info!("dispatcher shutting down");
-                    break;
                 }
             }
         }
@@ -202,9 +193,6 @@ impl Dispatcher {
             ForwardOutcome::Success {
                 ttfc,
                 audio_duration,
-                total_time: _,
-                rtf: _,
-                ..
             } => {
                 self.metrics.ttfc_seconds.observe(ttfc.as_secs_f64());
                 self.metrics
@@ -216,9 +204,7 @@ impl Dispatcher {
                 backend.scoring.record_ttfc(ttfc.as_secs_f64() * 1000.0);
                 backend.scoring.record_result(true);
                 backend.circuit.record_success();
-                backend.state = BackendState::Ready {
-                    since: Instant::now(),
-                };
+                backend.state = BackendState::Ready;
                 self.metrics
                     .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
@@ -237,8 +223,8 @@ impl Dispatcher {
                 let done = ServerMessage::Done {
                     stream_id: result.stream_id.0.clone(),
                     audio_duration: *audio_duration,
-                    total_time: (total_time * 100.0).round() / 100.0,
-                    rtf: (rtf * 100.0).round() / 100.0,
+                    total_time: round_2(total_time),
+                    rtf: round_2(rtf),
                 };
                 let _ = result
                     .client_tx
@@ -305,7 +291,6 @@ impl Dispatcher {
                         stream_id: result.stream_id,
                         text: result.text,
                         speaker_id: result.speaker_id,
-                        priority: result.priority,
                         client_tx: result.client_tx,
                         retries_remaining: result.retries_remaining - 1,
                         created_at: result.created_at,
@@ -335,9 +320,7 @@ impl Dispatcher {
 
             ForwardOutcome::ClientGone => {
                 let backend = &mut self.backends[backend_idx];
-                backend.state = BackendState::Ready {
-                    since: Instant::now(),
-                };
+                backend.state = BackendState::Ready;
                 self.metrics
                     .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
@@ -355,9 +338,7 @@ impl Dispatcher {
                 // The backend connection has been closed; mark Ready so it can
                 // accept the next dispatch (a fresh connection will be opened).
                 let backend = &mut self.backends[backend_idx];
-                backend.state = BackendState::Ready {
-                    since: Instant::now(),
-                };
+                backend.state = BackendState::Ready;
                 self.metrics
                     .set_backend_state(&backend.addr.to_string(), backend.state.name());
                 self.active_streams = self.active_streams.saturating_sub(1);
@@ -377,9 +358,7 @@ impl Dispatcher {
     fn handle_backend_recovered(&mut self, backend_id: BackendId) {
         let backend = &mut self.backends[backend_id.0];
         if matches!(backend.state, BackendState::Disconnected) {
-            backend.state = BackendState::Ready {
-                since: Instant::now(),
-            };
+            backend.state = BackendState::Ready;
             self.metrics
                 .set_backend_state(&backend.addr.to_string(), backend.state.name());
             tracing::debug!(backend = %backend_id, "backend recovered after cooldown");
@@ -446,10 +425,7 @@ impl Dispatcher {
 
     fn dispatch_to(&mut self, backend_id: BackendId, req: PendingRequest) {
         let backend_addr_str = self.backends[backend_id.0].addr.to_string();
-        self.backends[backend_id.0].state = BackendState::Busy {
-            since: Instant::now(),
-            stream_id: req.stream_id.clone(),
-        };
+        self.backends[backend_id.0].state = BackendState::Busy;
         self.metrics
             .set_backend_state(&backend_addr_str, self.backends[backend_id.0].state.name());
         self.active_streams += 1;

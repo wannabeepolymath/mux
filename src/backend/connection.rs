@@ -32,11 +32,6 @@ impl BackendConn {
         }
     }
 
-    /// WebSocket URL for this backend.
-    pub fn ws_url(&self) -> String {
-        format!("ws://{}/v1/ws/speech", self.addr)
-    }
-
     /// Whether this backend can accept a new request right now.
     pub fn is_available(&mut self) -> bool {
         self.state.is_ready() && self.circuit.can_attempt()

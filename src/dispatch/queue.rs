@@ -25,14 +25,6 @@ impl<T> BoundedQueue<T> {
         self.inner.len() >= self.max_depth
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn max_depth(&self) -> usize {
-        self.max_depth
-    }
-
     /// Add to the back of the queue. Returns Err if full.
     pub fn push_back(&mut self, item: T) -> Result<(), T> {
         if self.is_full() {
@@ -51,19 +43,9 @@ impl<T> BoundedQueue<T> {
         Ok(())
     }
 
-    /// Peek at the next item without removing.
-    pub fn front(&self) -> Option<&T> {
-        self.inner.front()
-    }
-
     /// Peek at an item by index without removing.
     pub fn peek_at(&self, idx: usize) -> Option<&T> {
         self.inner.get(idx)
-    }
-
-    /// Remove and return the next item.
-    pub fn pop_front(&mut self) -> Option<T> {
-        self.inner.pop_front()
     }
 
     /// Remove and return the item at the given index.
@@ -108,10 +90,10 @@ mod tests {
         q.push_back(1).unwrap();
         q.push_back(2).unwrap();
         q.push_back(3).unwrap();
-        assert_eq!(q.pop_front(), Some(1));
-        assert_eq!(q.pop_front(), Some(2));
-        assert_eq!(q.pop_front(), Some(3));
-        assert_eq!(q.pop_front(), None);
+        assert_eq!(q.remove_at(0), Some(1));
+        assert_eq!(q.remove_at(0), Some(2));
+        assert_eq!(q.remove_at(0), Some(3));
+        assert_eq!(q.remove_at(0), None);
     }
 
     #[test]
@@ -128,24 +110,15 @@ mod tests {
         q.push_back(2).unwrap();
         q.push_back(3).unwrap();
         q.push_front(1).unwrap();
-        assert_eq!(q.pop_front(), Some(1));
+        assert_eq!(q.peek_at(0).copied(), Some(1));
     }
 
     #[test]
     fn remove_by_stream_id() {
         let mut q: BoundedQueue<TestItem> = BoundedQueue::new(5);
-        q.push_back(TestItem {
-            id: "a".into(),
-        })
-        .unwrap();
-        q.push_back(TestItem {
-            id: "b".into(),
-        })
-        .unwrap();
-        q.push_back(TestItem {
-            id: "c".into(),
-        })
-        .unwrap();
+        q.push_back(TestItem { id: "a".into() }).unwrap();
+        q.push_back(TestItem { id: "b".into() }).unwrap();
+        q.push_back(TestItem { id: "c".into() }).unwrap();
 
         let removed = q.remove_by_stream_id(&StreamId::from("b"));
         assert!(removed.is_some());

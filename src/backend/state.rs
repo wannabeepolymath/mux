@@ -1,37 +1,30 @@
-use std::time::Instant;
-
-use crate::types::StreamId;
-
-/// Explicit state machine for a backend connection's lifecycle.
-#[derive(Debug)]
+/// State machine for a backend connection.
+///
+/// We don't model `Connecting` or `Draining` as distinct states because
+/// connections in this multiplexer are short-lived (one connection per request,
+/// established lazily by the forwarding task). `Disconnected` covers the gap
+/// between requests; `Busy` covers the entire span from "connecting" through
+/// "draining". This keeps the state machine minimal while preserving correct
+/// dispatch semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendState {
-    /// Establishing WebSocket connection to the backend.
-    Connecting,
     /// Connected and idle, ready to accept a request.
-    Ready { since: Instant },
+    Ready,
     /// Currently processing a request.
-    Busy { since: Instant, stream_id: StreamId },
-    /// Request done, draining remaining data before disconnect.
-    Draining { since: Instant },
-    /// Not connected. Will reconnect.
+    Busy,
+    /// Not connected. May be in post-failure cooldown.
     Disconnected,
 }
 
 impl BackendState {
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready { .. })
-    }
-
-    pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Busy { .. })
+        matches!(self, Self::Ready)
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Connecting => "connecting",
-            Self::Ready { .. } => "ready",
-            Self::Busy { .. } => "busy",
-            Self::Draining { .. } => "draining",
+            Self::Ready => "ready",
+            Self::Busy => "busy",
             Self::Disconnected => "disconnected",
         }
     }
