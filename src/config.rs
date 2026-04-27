@@ -42,8 +42,8 @@ pub struct CliArgs {
     #[arg(long, default_value = "4")]
     pub max_streams_per_conn: usize,
 
-    /// Max retry attempts per request
-    #[arg(long, default_value = "2")]
+    /// Max retry attempts per request (so total attempts = 1 + max_retries)
+    #[arg(long, default_value = "3")]
     pub max_retries: u32,
 }
 

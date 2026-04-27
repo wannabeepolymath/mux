@@ -1,6 +1,7 @@
 pub mod stream;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
@@ -28,7 +29,7 @@ pub async fn handle_client(
 
     tracing::debug!(client = %client_addr, "client connected");
 
-    let mut active_stream_count: usize = 0;
+    let active_count = Arc::new(AtomicUsize::new(0));
 
     while let Some(msg_result) = ws_stream.next().await {
         let msg = match msg_result {
@@ -50,8 +51,7 @@ pub async fn handle_client(
                             "stream_id": "",
                             "message": format!("invalid message: {e}"),
                         });
-                        let _ = client_tx
-                            .try_send(ClientEvent::Text(err_json.to_string()));
+                        let _ = client_tx.try_send(ClientEvent::Text(err_json.to_string()));
                         continue;
                     }
                 };
@@ -63,7 +63,8 @@ pub async fn handle_client(
                         speaker_id,
                         priority,
                     } => {
-                        if active_stream_count >= config.max_streams_per_conn {
+                        let current = active_count.load(Ordering::Relaxed);
+                        if current >= config.max_streams_per_conn {
                             let err_json = serde_json::json!({
                                 "type": "error",
                                 "stream_id": stream_id,
@@ -72,12 +73,12 @@ pub async fn handle_client(
                                     config.max_streams_per_conn
                                 ),
                             });
-                            let _ = client_tx
-                                .try_send(ClientEvent::Text(err_json.to_string()));
+                            let _ =
+                                client_tx.try_send(ClientEvent::Text(err_json.to_string()));
                             continue;
                         }
 
-                        active_stream_count += 1;
+                        active_count.fetch_add(1, Ordering::Relaxed);
 
                         let req = PendingRequest {
                             stream_id: StreamId(stream_id),
@@ -87,6 +88,8 @@ pub async fn handle_client(
                             client_tx: client_tx.clone(),
                             retries_remaining: config.max_retries,
                             created_at: Instant::now(),
+                            active_count: active_count.clone(),
+                            tried_backends: Vec::new(),
                         };
 
                         if dispatch_tx

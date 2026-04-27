@@ -51,9 +51,24 @@ impl<T> BoundedQueue<T> {
         Ok(())
     }
 
+    /// Peek at the next item without removing.
+    pub fn front(&self) -> Option<&T> {
+        self.inner.front()
+    }
+
+    /// Peek at an item by index without removing.
+    pub fn peek_at(&self, idx: usize) -> Option<&T> {
+        self.inner.get(idx)
+    }
+
     /// Remove and return the next item.
     pub fn pop_front(&mut self) -> Option<T> {
         self.inner.pop_front()
+    }
+
+    /// Remove and return the item at the given index.
+    pub fn remove_at(&mut self, idx: usize) -> Option<T> {
+        self.inner.remove(idx)
     }
 }
 

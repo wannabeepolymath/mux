@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::dispatch::{ClientEvent, PendingRequest};
@@ -25,6 +27,7 @@ pub enum ForwardOutcome {
     MalformedResponse(String),
     BackendError(String),
     ClientGone,
+    Cancelled,
 }
 
 /// Full result returned to the Dispatcher, carrying request data back for retries.
@@ -38,15 +41,20 @@ pub struct ForwardResult {
     pub priority: u32,
     pub retries_remaining: u32,
     pub created_at: Instant,
+    pub active_count: Arc<AtomicUsize>,
+    pub tried_backends: Vec<BackendId>,
 }
 
 /// Execute a single forwarding attempt: connect to backend, send request,
 /// stream audio chunks back to the client.
+///
+/// `cancel_rx` lets the dispatcher abort an in-flight stream on client request.
 pub async fn run_forwarding(
     backend_id: BackendId,
     backend_addr: SocketAddr,
     request: PendingRequest,
     hang_timeout: Duration,
+    cancel_rx: oneshot::Receiver<()>,
 ) -> ForwardResult {
     let stream_id = request.stream_id.clone();
 
@@ -57,6 +65,7 @@ pub async fn run_forwarding(
         request.speaker_id,
         &request.client_tx,
         hang_timeout,
+        cancel_rx,
     )
     .await;
 
@@ -70,6 +79,8 @@ pub async fn run_forwarding(
         priority: request.priority,
         retries_remaining: request.retries_remaining,
         created_at: request.created_at,
+        active_count: request.active_count,
+        tried_backends: request.tried_backends,
     }
 }
 
@@ -80,13 +91,26 @@ async fn do_forward(
     speaker_id: u32,
     client_tx: &mpsc::Sender<ClientEvent>,
     hang_timeout: Duration,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) -> ForwardOutcome {
     let url = format!("ws://{}/v1/ws/speech", backend_addr);
-    let mut ws = match tokio_tungstenite::connect_async(&url).await {
-        Ok((ws, _)) => ws,
-        Err(e) => {
-            tracing::warn!(backend = %backend_addr, "connect failed: {e}");
-            return ForwardOutcome::BackendError(format!("connect failed: {e}"));
+    let connect_timeout = Duration::from_secs(3);
+    let mut ws = tokio::select! {
+        result = tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(&url)) => {
+            match result {
+                Ok(Ok((ws, _))) => ws,
+                Ok(Err(e)) => {
+                    tracing::warn!(backend = %backend_addr, "connect failed: {e}");
+                    return ForwardOutcome::BackendError(format!("connect failed: {e}"));
+                }
+                Err(_) => {
+                    tracing::warn!(backend = %backend_addr, "connect timed out after {connect_timeout:?}");
+                    return ForwardOutcome::BackendError("connect timeout".into());
+                }
+            }
+        }
+        _ = &mut cancel_rx => {
+            return ForwardOutcome::Cancelled;
         }
     };
 
@@ -108,81 +132,93 @@ async fn do_forward(
     let mut total_bytes: usize = 0;
 
     loop {
-        let read = tokio::time::timeout(hang_timeout, ws.next()).await;
-
-        match read {
-            Err(_elapsed) => {
-                tracing::warn!(
+        tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                tracing::debug!(
                     backend = %backend_addr,
                     stream = %stream_id,
-                    "hung — no data in {hang_timeout:?}"
+                    "stream cancelled, closing backend connection"
                 );
-                return ForwardOutcome::BackendHung;
+                let _ = ws.close(None).await;
+                return ForwardOutcome::Cancelled;
             }
-            Ok(None) => {
-                tracing::warn!(
-                    backend = %backend_addr,
-                    stream = %stream_id,
-                    "connection closed without done"
-                );
-                return ForwardOutcome::BackendCrashed;
-            }
-            Ok(Some(Err(e))) => {
-                tracing::warn!(
-                    backend = %backend_addr,
-                    stream = %stream_id,
-                    "ws error: {e}"
-                );
-                return ForwardOutcome::BackendCrashed;
-            }
-            Ok(Some(Ok(msg))) => match msg {
-                Message::Binary(data) => {
-                    if first_chunk_time.is_none() {
-                        first_chunk_time = Some(Instant::now());
+            read = tokio::time::timeout(hang_timeout, ws.next()) => {
+                match read {
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            backend = %backend_addr,
+                            stream = %stream_id,
+                            "hung — no data in {hang_timeout:?}"
+                        );
+                        return ForwardOutcome::BackendHung;
                     }
-                    total_bytes += data.len();
+                    Ok(None) => {
+                        tracing::warn!(
+                            backend = %backend_addr,
+                            stream = %stream_id,
+                            "connection closed without done"
+                        );
+                        return ForwardOutcome::BackendCrashed;
+                    }
+                    Ok(Some(Err(e))) => {
+                        tracing::warn!(
+                            backend = %backend_addr,
+                            stream = %stream_id,
+                            "ws error: {e}"
+                        );
+                        return ForwardOutcome::BackendCrashed;
+                    }
+                    Ok(Some(Ok(msg))) => match msg {
+                        Message::Binary(data) => {
+                            if first_chunk_time.is_none() {
+                                first_chunk_time = Some(Instant::now());
+                            }
+                            total_bytes += data.len();
 
-                    let tagged = encode_binary_frame(&stream_id.0, &data);
-                    if send_to_client(client_tx, ClientEvent::Binary(tagged)).is_err() {
-                        return ForwardOutcome::ClientGone;
-                    }
-                }
-                Message::Text(text_data) => {
-                    let backend_msg = BackendMessage::from_text(&text_data);
-                    match backend_msg {
-                        BackendMessage::Queued { .. } => {}
-                        BackendMessage::Done {
-                            audio_duration,
-                            total_time,
-                            rtf,
-                            ..
-                        } => {
-                            let ttfc = first_chunk_time
-                                .map(|t| t.duration_since(request_start))
-                                .unwrap_or_default();
+                            let tagged = encode_binary_frame(&stream_id.0, &data);
+                            if send_to_client(client_tx, ClientEvent::Binary(tagged)).is_err() {
+                                return ForwardOutcome::ClientGone;
+                            }
+                        }
+                        Message::Text(text_data) => {
+                            let backend_msg = BackendMessage::from_text(&text_data);
+                            match backend_msg {
+                                BackendMessage::Queued { .. } => {}
+                                BackendMessage::Done {
+                                    audio_duration,
+                                    total_time,
+                                    rtf,
+                                    ..
+                                } => {
+                                    let ttfc = first_chunk_time
+                                        .map(|t| t.duration_since(request_start))
+                                        .unwrap_or_default();
 
-                            return ForwardOutcome::Success {
-                                ttfc,
-                                audio_duration,
-                                total_time,
-                                rtf,
-                                total_bytes,
-                            };
+                                    return ForwardOutcome::Success {
+                                        ttfc,
+                                        audio_duration,
+                                        total_time,
+                                        rtf,
+                                        total_bytes,
+                                    };
+                                }
+                                BackendMessage::Error { message } => {
+                                    return ForwardOutcome::BackendError(message);
+                                }
+                                BackendMessage::Unknown(raw) => {
+                                    return ForwardOutcome::MalformedResponse(raw);
+                                }
+                                BackendMessage::AudioData(_) => {}
+                            }
                         }
-                        BackendMessage::Error { message } => {
-                            return ForwardOutcome::BackendError(message);
+                        Message::Close(_) => {
+                            return ForwardOutcome::BackendCrashed;
                         }
-                        BackendMessage::Unknown(raw) => {
-                            return ForwardOutcome::MalformedResponse(raw);
-                        }
-                        BackendMessage::AudioData(_) => {}
-                    }
+                        _ => {}
+                    },
                 }
-                Message::Close(_) => {
-                    return ForwardOutcome::BackendCrashed;
-                }
-                _ => {}
-            },
+            }
         }
     }
 }
