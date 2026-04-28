@@ -4,6 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 ///
 /// Wire format:
 ///   [id_len: 1 byte] [stream_id: id_len bytes UTF-8] [pcm_payload: remaining]
+#[inline]
 pub fn encode_binary_frame(stream_id: &str, pcm_payload: &[u8]) -> Bytes {
     let id_bytes = stream_id.as_bytes();
     debug_assert!(

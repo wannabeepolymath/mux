@@ -27,7 +27,7 @@ pub struct CliArgs {
     pub circuit_threshold: u32,
 
     /// Circuit breaker cooldown in seconds
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "1")]
     pub circuit_cooldown_secs: u64,
 
     /// Max global queue depth

@@ -7,28 +7,28 @@ stream multiplexing, backpressure handling, and performance.
 
 Usage:
     # Correctness basics
-    python test_client.py ws://localhost:9000/v1/ws/speech
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech
 
     # Chaos survival (run with default chaotic mock)
-    python test_client.py ws://localhost:9000/v1/ws/speech --chaos --requests 200
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --chaos --requests 200
 
     # Stream multiplexing
-    python test_client.py ws://localhost:9000/v1/ws/speech --multiplex
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --multiplex
 
     # Slow consumer backpressure
-    python test_client.py ws://localhost:9000/v1/ws/speech --slow-consumer
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --slow-consumer
 
     # Soak test (sustained load, memory check)
-    python test_client.py ws://localhost:9000/v1/ws/speech --soak 600
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --soak 600
 
     # Kill a backend mid-test (tests circuit breaker)
-    python test_client.py ws://localhost:9000/v1/ws/speech --kill-backend 9107
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --kill-backend 9107
 
     # Full suite
-    python test_client.py ws://localhost:9000/v1/ws/speech --all
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --all
 
     # Performance comparison
-    python test_client.py ws://localhost:9000/v1/ws/speech --compare ws://localhost:9100/v1/ws/speech
+    python assignment/test_client.py ws://localhost:9000/v1/ws/speech --compare ws://localhost:9100/v1/ws/speech
 """
 
 import argparse

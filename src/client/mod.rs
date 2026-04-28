@@ -24,7 +24,8 @@ pub async fn handle_client(
 ) {
     metrics.active_connections.inc();
     let (ws_sink, mut ws_stream) = ws.split();
-    let (client_tx, client_rx) = mpsc::channel::<ClientEvent>(64);
+    // Large enough for many concurrent streams × chunks without try_send loss.
+    let (client_tx, client_rx) = mpsc::channel::<ClientEvent>(4096);
 
     let writer_handle = tokio::spawn(client_writer(ws_sink, client_rx));
 
@@ -91,13 +92,11 @@ pub async fn handle_client(
                             tried_backends: Vec::new(),
                         };
 
-                        if dispatch_tx
-                            .send(DispatchEvent::NewRequest(req))
-                            .await
-                            .is_err()
-                        {
-                            tracing::error!("dispatcher channel closed");
-                            break;
+                        if let Err(e) = dispatch_tx.try_send(DispatchEvent::NewRequest(req)) {
+                            if dispatch_tx.send(e.into_inner()).await.is_err() {
+                                tracing::error!("dispatcher channel closed");
+                                break;
+                            }
                         }
                     }
                     ClientMessage::Cancel { stream_id } => {

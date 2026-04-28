@@ -26,6 +26,9 @@ pub async fn run_server(
                 continue;
             }
         };
+        if let Err(e) = tcp_stream.set_nodelay(true) {
+            tracing::debug!(client = %addr, "set_nodelay on client: {e}");
+        }
 
         let dispatch_tx = dispatch_tx.clone();
         let config = config.clone();

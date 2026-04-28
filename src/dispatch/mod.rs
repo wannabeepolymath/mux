@@ -238,6 +238,38 @@ impl Dispatcher {
                 );
             }
 
+            ForwardOutcome::BackendBusy => {
+                let backend = &mut self.backends[backend_idx];
+                backend.state = BackendState::Ready;
+                self.metrics
+                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
+                self.active_streams = self.active_streams.saturating_sub(1);
+                self.metrics.active_streams.set(self.active_streams as i64);
+
+                tracing::debug!(
+                    stream = %result.stream_id,
+                    backend = %result.backend_id,
+                    "backend busy, requeue without penalty"
+                );
+
+                let mut tried = result.tried_backends;
+                if !tried.contains(&result.backend_id) {
+                    tried.push(result.backend_id);
+                }
+                let retry = PendingRequest {
+                    stream_id: result.stream_id,
+                    text: result.text,
+                    speaker_id: result.speaker_id,
+                    client_tx: result.client_tx,
+                    retries_remaining: result.retries_remaining,
+                    created_at: result.created_at,
+                    active_count: result.active_count,
+                    tried_backends: tried,
+                };
+                let _ = self.queue.push_front(retry);
+                self.metrics.queue_depth.set(self.queue.len() as i64);
+            }
+
             ForwardOutcome::BackendCrashed
             | ForwardOutcome::BackendHung
             | ForwardOutcome::MalformedResponse(_)
@@ -463,9 +495,22 @@ impl Dispatcher {
 
     /// Pick the best available backend: lowest TTFC EWMA among those with
     /// error rate < 30% and a closed/half-open circuit.
+    /// If every backend in the window is "too hot" (common under chaos), falls
+    /// back to the same score comparison without the error-rate filter so work
+    /// is never left permanently undispatchable.
     /// Uses round-robin as tiebreaker when scores are equal.
     /// Excludes backends in the `exclude` list (already tried for this request).
     fn find_best_backend(&mut self, exclude: &[BackendId]) -> Option<BackendId> {
+        self.find_best_backend_filtered(exclude, true)
+            .or_else(|| self.find_best_backend_filtered(exclude, false))
+    }
+
+    /// `prefer_low_error`: when true, skip backends with recent error rate ≥ 30%.
+    fn find_best_backend_filtered(
+        &mut self,
+        exclude: &[BackendId],
+        prefer_low_error: bool,
+    ) -> Option<BackendId> {
         let n = self.backends.len();
         let mut best: Option<(BackendId, f64)> = None;
 
@@ -479,7 +524,7 @@ impl Dispatcher {
             if !backend.is_available() {
                 continue;
             }
-            if backend.scoring.error_rate() >= 0.30 {
+            if prefer_low_error && backend.scoring.error_rate() >= 0.30 {
                 continue;
             }
 

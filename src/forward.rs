@@ -12,6 +12,7 @@ use crate::metrics::Metrics;
 use crate::protocol::backend::BackendMessage;
 use crate::protocol::frame::encode_binary_frame;
 use crate::types::{BackendId, StreamId};
+use tokio_tungstenite::MaybeTlsStream;
 
 /// Outcome of a forwarding attempt.
 #[derive(Debug)]
@@ -23,6 +24,9 @@ pub enum ForwardOutcome {
     BackendCrashed,
     BackendHung,
     MalformedResponse(String),
+    /// Backend accepted the connection but refused the start (contention).
+    /// Not a failure for circuit/scoring; request should be retried elsewhere.
+    BackendBusy,
     BackendError(String),
     ClientGone,
     Cancelled,
@@ -112,6 +116,7 @@ async fn do_forward(
             return ForwardOutcome::Cancelled;
         }
     };
+    nodelay_backend_stream(ws.get_ref());
 
     let start_json = serde_json::json!({
         "type": "start",
@@ -175,14 +180,22 @@ async fn do_forward(
 
                             let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
-                            let send_result =
-                                send_to_client(client_tx, ClientEvent::Binary(tagged));
+                            // Backpressure: wait for client without dropping chunks.
+                            tokio::select! {
+                                biased;
+                                _ = &mut cancel_rx => {
+                                    let _ = ws.close(None).await;
+                                    return ForwardOutcome::Cancelled;
+                                }
+                                send = client_tx.send(ClientEvent::Binary(tagged)) => {
+                                    if send.is_err() {
+                                        return ForwardOutcome::ClientGone;
+                                    }
+                                }
+                            }
                             metrics
                                 .chunk_forward_seconds
                                 .observe(chunk_start.elapsed().as_secs_f64());
-                            if send_result.is_err() {
-                                return ForwardOutcome::ClientGone;
-                            }
                         }
                         Message::Text(text_data) => {
                             let backend_msg = BackendMessage::from_text(&text_data);
@@ -199,6 +212,9 @@ async fn do_forward(
                                     };
                                 }
                                 BackendMessage::Error { message } => {
+                                    if message.to_lowercase().contains("busy") {
+                                        return ForwardOutcome::BackendBusy;
+                                    }
                                     return ForwardOutcome::BackendError(message);
                                 }
                                 BackendMessage::Unknown(raw) => {
@@ -217,16 +233,9 @@ async fn do_forward(
     }
 }
 
-fn send_to_client(tx: &mpsc::Sender<ClientEvent>, event: ClientEvent) -> Result<(), ()> {
-    match tx.try_send(event) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            tracing::debug!("client disconnected, stopping forward");
-            Err(())
-        }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!("client buffer full, dropping chunk");
-            Ok(())
-        }
+/// Disable Nagle on the backend TCP connection to avoid small-packet delays on TTFC.
+fn nodelay_backend_stream(stream: &MaybeTlsStream<tokio::net::TcpStream>) {
+    if let MaybeTlsStream::Plain(tcp) = stream {
+        let _ = tcp.set_nodelay(true);
     }
 }
