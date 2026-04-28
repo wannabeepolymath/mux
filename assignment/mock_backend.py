@@ -24,6 +24,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import logging
 import os
 import signal
 import struct
@@ -39,6 +40,21 @@ try:
 except ImportError:
     print("Install websockets: pip install websockets>=13.0")
     sys.exit(1)
+
+
+def _configure_websocket_logging(*, log_handshake_failures: bool) -> None:
+    """websockets logs ERROR + traceback when a peer drops during the HTTP upgrade.
+
+    That is normal noise (HTTP probes, wrong client, IDE port checks). Suppress by default.
+    """
+    if log_handshake_failures:
+        return
+
+    class _DropOpeningHandshakeSpam(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.getMessage() != "opening handshake failed"
+
+    logging.getLogger("websockets.server").addFilter(_DropOpeningHandshakeSpam())
 
 
 SAMPLE_RATE = 24000
@@ -324,6 +340,11 @@ Use --calm to disable all chaos for initial development.
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--base-port", type=int, default=9100)
     parser.add_argument("--health-port", type=int, default=9099)
+    parser.add_argument(
+        "--log-ws-handshakes",
+        action="store_true",
+        help="Log failed WebSocket opening handshakes (verbose; usually peer aborted upgrade)",
+    )
     parser.add_argument("--first-chunk-delay", type=float, default=0.3)
     parser.add_argument("--chunk-interval", type=float, default=0.25)
 
@@ -378,6 +399,8 @@ Use --calm to disable all chaos for initial development.
             w.speed_multiplier = random.uniform(1.0, 3.0)
 
     shutdown_event = asyncio.Event()
+
+    _configure_websocket_logging(log_handshake_failures=args.log_ws_handshakes)
 
     def signal_handler():
         print("\nShutting down...")

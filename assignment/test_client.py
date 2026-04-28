@@ -160,8 +160,15 @@ async def send_single_request(
         total_bytes = 0
         chunks = 0
 
-        async for message in ws:
-            if time.monotonic() - start > timeout:
+        deadline = start + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result.error = "timeout"
+                return result
+            try:
+                message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
                 result.error = "timeout"
                 return result
 
@@ -787,6 +794,10 @@ async def suite_slow_consumer(url: str) -> SuiteResult:
 async def suite_soak(url: str, duration_seconds: int = 120, concurrency: int = 8) -> SuiteResult:
     suite = SuiteResult(name=f"Soak Test ({duration_seconds}s, {concurrency} concurrent)", passed=True, total_tests=1)
 
+    # Per-request wall-clock limit must cover queueing behind peer streams at the mux/backend,
+    # not just processing time (otherwise steady snapshots look fine while stragglers time out).
+    req_timeout = max(120.0, float(duration_seconds) + 120.0)
+
     results = []
     sem = asyncio.Semaphore(concurrency)
     stop = asyncio.Event()
@@ -798,11 +809,14 @@ async def suite_soak(url: str, duration_seconds: int = 120, concurrency: int = 8
             async with sem:
                 if stop.is_set():
                     break
-                r = await send_single_request(url, text, stream_id=f"soak-{idx}", timeout=30.0)
+                r = await send_single_request(url, text, stream_id=f"soak-{idx}", timeout=req_timeout)
                 results.append(r)
                 idx += 1
 
-    print(f"  Running soak test for {duration_seconds}s with {concurrency} concurrency...")
+    print(
+        f"  Running soak test for {duration_seconds}s with {concurrency} concurrency "
+        f"(per-request timeout {req_timeout:.0f}s)...",
+    )
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
 
     # Sample memory usage periodically (of the test client itself —
