@@ -309,21 +309,26 @@ impl Dispatcher {
             | ForwardOutcome::BackendHung
             | ForwardOutcome::MalformedResponse(_)
             | ForwardOutcome::BackendError(_) => {
-                {
+                let circuit_just_opened = {
                     let backend = &mut self.backends[backend_idx];
                     backend.scoring.record_result(false);
                     let penalty_ms = self.config.hang_timeout.as_secs_f64() * 1000.0;
                     backend.scoring.record_ttfc(penalty_ms);
+                    let was_closed_or_half_open = backend.circuit.can_attempt();
                     backend.circuit.record_failure();
-                    // Don't mark Ready immediately — cooldown prevents retries
-                    // hitting the same (possibly still-hung) backend.
+                    let just_opened = was_closed_or_half_open
+                        && matches!(
+                            backend.circuit.state(),
+                            crate::backend::circuit::CircuitState::Open,
+                        );
                     backend.state = BackendState::Disconnected;
                     backend.conn = None;
                     self.metrics
                         .set_backend_state(&backend.addr.to_string(), backend.state.name());
-                    self.active_streams = self.active_streams.saturating_sub(1);
-                    self.metrics.active_streams.set(self.active_streams as i64);
-                }
+                    just_opened
+                };
+                self.active_streams = self.active_streams.saturating_sub(1);
+                self.metrics.active_streams.set(self.active_streams as i64);
 
                 let reason = match &result.outcome {
                     ForwardOutcome::BackendCrashed => "crashed".to_string(),
@@ -380,7 +385,16 @@ impl Dispatcher {
                         .try_send(ClientEvent::Text(err.to_json()));
                 }
 
-                self.spawn_reconnect_after_failure(result.backend_id);
+                if circuit_just_opened {
+                    tracing::info!(
+                        backend = %result.backend_id,
+                        cooldown = ?self.config.circuit_cooldown,
+                        "circuit opened; scheduling recovery timer"
+                    );
+                    self.spawn_circuit_cooldown_timer(result.backend_id);
+                } else {
+                    self.spawn_reconnect_after_failure(result.backend_id);
+                }
             }
 
             ForwardOutcome::ClientGone => {
@@ -694,11 +708,23 @@ impl Dispatcher {
         self.spawn_connect(backend_id);
     }
 
-    /// Same as spawn_reconnect_if_circuit_allows for now. Task 9 will modify this
-    /// to additionally schedule the circuit-cooldown timer when the circuit
-    /// just opened on this failure.
+    /// Same as spawn_reconnect_if_circuit_allows when the circuit did NOT just open.
     fn spawn_reconnect_after_failure(&mut self, backend_id: BackendId) {
         self.spawn_reconnect_if_circuit_allows(backend_id);
+    }
+
+    /// One-shot timer: when a backend's circuit just opened, schedule a
+    /// BackendRecovered event after the cooldown elapses so the dispatcher
+    /// can transition it back to Connecting.
+    fn spawn_circuit_cooldown_timer(&self, backend_id: BackendId) {
+        let dispatch_tx = self.dispatch_tx.clone();
+        let cooldown = self.config.circuit_cooldown;
+        tokio::spawn(async move {
+            tokio::time::sleep(cooldown).await;
+            let _ = dispatch_tx
+                .send(DispatchEvent::BackendRecovered(backend_id))
+                .await;
+        });
     }
 
     /// Build a snapshot of the dispatcher's state for the /health endpoint.
