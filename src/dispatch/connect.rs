@@ -1,4 +1,12 @@
+use std::net::SocketAddr;
 use std::time::Duration;
+
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_tungstenite::MaybeTlsStream;
+
+use super::DispatchEvent;
+use crate::types::BackendId;
 
 /// Compute the reconnect backoff for a given attempt number.
 ///
@@ -38,6 +46,60 @@ fn jitter_pct(center_ms: u64, pct: u64) -> i64 {
         .map(|d| d.subsec_nanos() as i64)
         .unwrap_or(0);
     (nanos % (2 * max + 1)) - max
+}
+
+/// Open a WebSocket connection to a backend, then send either
+/// ConnectionEstablished or ConnectionFailed back to the dispatcher.
+///
+/// `attempt` controls the backoff delay (0 = immediate, higher = exponential).
+pub async fn connect_task(
+    addr: SocketAddr,
+    backend_id: BackendId,
+    dispatch_tx: mpsc::Sender<DispatchEvent>,
+    connect_timeout: std::time::Duration,
+    attempt: u32,
+) {
+    let backoff = backoff_for_attempt(attempt);
+    if !backoff.is_zero() {
+        tokio::time::sleep(backoff).await;
+    }
+
+    let url = format!("ws://{addr}/v1/ws/speech");
+
+    let result =
+        tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(&url)).await;
+
+    match result {
+        Ok(Ok((ws, _resp))) => {
+            // Disable Nagle for low TTFC.
+            nodelay_backend_stream(ws.get_ref());
+            let _ = dispatch_tx
+                .send(DispatchEvent::ConnectionEstablished { backend_id, ws })
+                .await;
+        }
+        Ok(Err(e)) => {
+            let _ = dispatch_tx
+                .send(DispatchEvent::ConnectionFailed {
+                    backend_id,
+                    error: format!("connect: {e}"),
+                })
+                .await;
+        }
+        Err(_) => {
+            let _ = dispatch_tx
+                .send(DispatchEvent::ConnectionFailed {
+                    backend_id,
+                    error: "connect timeout".into(),
+                })
+                .await;
+        }
+    }
+}
+
+fn nodelay_backend_stream(stream: &MaybeTlsStream<TcpStream>) {
+    if let MaybeTlsStream::Plain(tcp) = stream {
+        let _ = tcp.set_nodelay(true);
+    }
 }
 
 #[cfg(test)]
