@@ -545,11 +545,9 @@ impl Dispatcher {
 
     fn dispatch_to(&mut self, backend_id: BackendId, req: PendingRequest) {
         let backend_addr_str = self.backends[backend_id.0].addr.to_string();
-        let ws = match self.backends[backend_id.0].conn.take() {
+        let ws = match self.backends[backend_id.0].take_for_dispatch() {
             Some(ws) => ws,
             None => {
-                // Defensive: try_dispatch should have filtered via is_available()
-                // which checks conn.is_some(). If we're here, log and skip.
                 tracing::error!(
                     backend = %backend_id,
                     "dispatch_to called but no warm slot — re-queueing"
@@ -560,9 +558,11 @@ impl Dispatcher {
             }
         };
 
-        self.backends[backend_id.0].state = BackendState::Busy;
-        self.metrics
-            .set_backend_state(&backend_addr_str, self.backends[backend_id.0].state.name());
+        // take_for_dispatch already set state to Busy; just sync the metric.
+        self.metrics.set_backend_state(
+            &backend_addr_str,
+            self.backends[backend_id.0].state.name(),
+        );
         self.active_streams += 1;
         self.metrics.active_streams.set(self.active_streams as i64);
 

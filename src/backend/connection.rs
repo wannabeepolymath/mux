@@ -53,6 +53,18 @@ impl BackendConn {
         self.state.is_ready() && self.conn.is_some() && self.circuit.can_attempt()
     }
 
+    /// Atomically transition Ready → Busy and take the warm slot.
+    /// Returns None if no warm slot was available (caller should re-queue).
+    /// The state mutation and slot take happen together so the invariant
+    /// `conn.is_some() ⇔ state == Ready` is never transiently violated.
+    pub fn take_for_dispatch(&mut self) -> Option<BackendWs> {
+        if !matches!(self.state, BackendState::Ready) || self.conn.is_none() {
+            return None;
+        }
+        self.state = BackendState::Busy;
+        self.conn.take()
+    }
+
     /// Debug-only check: warm slot must be present iff state is Ready.
     /// The spec invariant — `conn.is_some() ⇔ state == Ready` — is documented
     /// in §3.1 of the design doc; this is the runtime guard.

@@ -13,6 +13,14 @@ pub enum BackendState {
     /// Forwarding task is using the connection.
     Busy,
     /// Forwarding task is draining the close handshake (passive-close window).
+    ///
+    /// Currently never assigned — the drain happens inside the spawned forwarding
+    /// task (see `forward::drain_close`), and ownership has already moved out of
+    /// the dispatcher by then. Surfacing this state via `/health` would require a
+    /// dedicated `DrainStarted`/`DrainEnded` event, which the spec acknowledged
+    /// (§3.2) but the plan did not operationalize. Variant kept so the state name
+    /// remains in the enum vocabulary if observability is added later.
+    #[allow(dead_code)]
     Draining,
     /// No connection, no in-flight connect. Transient — should immediately
     /// be followed by spawning a connect task (unless circuit is open).
