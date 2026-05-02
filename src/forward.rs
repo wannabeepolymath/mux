@@ -120,7 +120,7 @@ async fn do_forward(
         .send(Message::Text(start_json.to_string().into()))
         .await
     {
-        tracing::warn!("send start failed: {e}");
+        tracing::warn!(stream = %stream_id, "send start failed: {e}");
         drain_close(ws, drain_timeout).await;
         return ForwardOutcome::BackendCrashed;
     }
@@ -135,11 +135,7 @@ async fn do_forward(
                 tracing::debug!(stream = %stream_id, "stream cancelled");
                 // Best-effort: try to send WS Close, then short drain. Backend
                 // doesn't support cancel, so we'll likely end as active closer.
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(50),
-                    ws.close(None),
-                ).await;
-                drain_close(ws, drain_timeout).await;
+                active_close(ws, drain_timeout).await;
                 return ForwardOutcome::Cancelled;
             }
             read = tokio::time::timeout(hang_timeout, ws.next()) => {
@@ -171,11 +167,7 @@ async fn do_forward(
                             tokio::select! {
                                 biased;
                                 _ = &mut cancel_rx => {
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_millis(50),
-                                        ws.close(None),
-                                    ).await;
-                                    drain_close(ws, drain_timeout).await;
+                                    active_close(ws, drain_timeout).await;
                                     return ForwardOutcome::Cancelled;
                                 }
                                 send = client_tx.send(ClientEvent::Binary(tagged)) => {
@@ -183,11 +175,7 @@ async fn do_forward(
                                         // Client gone: backend keeps producing. Drain briefly
                                         // and drop. Active-close cost on this path is acceptable
                                         // (rare).
-                                        let _ = tokio::time::timeout(
-                                            Duration::from_millis(50),
-                                            ws.close(None),
-                                        ).await;
-                                        drain_close(ws, drain_timeout).await;
+                                        active_close(ws, drain_timeout).await;
                                         return ForwardOutcome::ClientGone;
                                     }
                                 }
@@ -256,8 +244,15 @@ async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> 
                     }
                 }
                 BackendMessage::Unknown(raw) => ForwardOutcome::MalformedResponse(raw),
-                BackendMessage::Done { .. } | BackendMessage::Queued => {
-                    ForwardOutcome::MalformedResponse(format!("pre-start: {t}"))
+                BackendMessage::Done { .. } => {
+                    tracing::warn!(
+                        "pre-start `done` on warm slot — likely a warm-pool drain bug \
+                         (previous request's done frame leaked into this slot)"
+                    );
+                    ForwardOutcome::MalformedResponse(format!("pre-start done: {t}"))
+                }
+                BackendMessage::Queued => {
+                    ForwardOutcome::MalformedResponse(format!("pre-start queued: {t}"))
                 }
             })
         }
@@ -265,6 +260,14 @@ async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> 
             "pre-start binary".to_string(),
         )),
     }
+}
+
+/// Best-effort active close: send WS Close frame (capped at 50ms), then drain.
+/// Used on Cancel/ClientGone paths where we want to be polite even though the
+/// server doesn't support cancellation and will likely keep producing frames.
+async fn active_close(ws: &mut BackendWs, drain_timeout: Duration) {
+    let _ = tokio::time::timeout(Duration::from_millis(50), ws.close(None)).await;
+    drain_close(ws, drain_timeout).await;
 }
 
 /// Drain reads to EOF (or timeout) so the peer's FIN arrives before our drop
