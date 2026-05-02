@@ -1,3 +1,4 @@
+pub mod connect;
 pub mod queue;
 
 use std::collections::HashMap;
