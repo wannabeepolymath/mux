@@ -399,3 +399,4 @@ If we add unit tests, target:
 - Periodic keepalive ping for warm connections.
 - Dynamic `drain_timeout` based on observed close-handshake latency.
 - Observability: histogram of drain duration, gauge of warm-slot age.
+- **Liveness fallback for stuck `Connecting` state**: if a `connect_task` panics or is dropped without sending either `ConnectionEstablished` or `ConnectionFailed`, the backend stays `Connecting` forever and is never dispatched to. Today no path produces this, but the dispatcher has no defense if `connect_task`'s contract is ever broken. Mitigations to consider: wrap the spawn body in `catch_unwind` and emit `ConnectionFailed` from the panic arm, OR add a per-backend connect-watchdog timer that emits a synthetic `ConnectionFailed` if the backend stays `Connecting` past `connect_timeout * 2`.

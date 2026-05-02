@@ -33,7 +33,13 @@ pub struct Metrics {
 
 /// All states a backend can be in. The metrics endpoint emits a gauge for each
 /// (addr, state) pair so consumers can count by state in queries.
-const BACKEND_STATES: [&str; 3] = ["ready", "busy", "disconnected"];
+const BACKEND_STATES: [&str; 5] = [
+    "connecting",
+    "ready",
+    "busy",
+    "draining",
+    "disconnected",
+];
 
 impl Metrics {
     pub fn new() -> Result<Self, prometheus::Error> {

@@ -446,7 +446,36 @@ impl Dispatcher {
         backend_id: BackendId,
         ws: crate::backend::BackendWs,
     ) {
+        let current_state = self.backends[backend_id.0].state;
+        if !matches!(current_state, BackendState::Connecting) {
+            // We received a connection for a backend that wasn't expecting one
+            // (could happen if a connect_task races a circuit-open, or if some
+            // future code spawns redundant connects). Don't overwrite the slot —
+            // drain and drop the unexpected ws in a separate task so we don't
+            // become the active TCP closer.
+            tracing::warn!(
+                backend = %backend_id,
+                state = %current_state,
+                "ConnectionEstablished for backend not in Connecting state; draining + dropping ws"
+            );
+            let drain_timeout = self.config.drain_timeout;
+            tokio::spawn(async move {
+                use futures_util::StreamExt;
+                let mut ws = ws;
+                let _ = tokio::time::timeout(drain_timeout, async {
+                    while ws.next().await.is_some() {}
+                })
+                .await;
+            });
+            return;
+        }
+
         let backend = &mut self.backends[backend_id.0];
+        debug_assert!(
+            backend.conn.is_none(),
+            "Connecting state must have empty slot, found {:?}",
+            backend.conn.as_ref().map(|_| "Some"),
+        );
         backend.conn = Some(ws);
         backend.state = BackendState::Ready;
         backend.reconnect_attempt = 0;
