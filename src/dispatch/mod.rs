@@ -34,6 +34,16 @@ pub enum DispatchEvent {
     CancelStream { stream_id: StreamId },
     /// Health endpoint requested a snapshot of the dispatcher's state.
     QueryHealth(oneshot::Sender<HealthSnapshot>),
+    /// Connect task succeeded — hand over the warm ws.
+    ConnectionEstablished {
+        backend_id: BackendId,
+        ws: crate::backend::BackendWs,
+    },
+    /// Connect task failed — schedule retry (subject to circuit state).
+    ConnectionFailed {
+        backend_id: BackendId,
+        error: String,
+    },
 }
 
 // ── Request types ───────────────────────────────────────────────────────
@@ -138,6 +148,12 @@ impl Dispatcher {
                 DispatchEvent::CancelStream { stream_id } => self.handle_cancel(&stream_id),
                 DispatchEvent::QueryHealth(reply) => {
                     let _ = reply.send(self.snapshot());
+                }
+                DispatchEvent::ConnectionEstablished { backend_id, ws } => {
+                    self.handle_connection_established(backend_id, ws);
+                }
+                DispatchEvent::ConnectionFailed { backend_id, error } => {
+                    self.handle_connection_failed(backend_id, error);
                 }
             }
         }
@@ -386,6 +402,20 @@ impl Dispatcher {
         }
 
         self.try_dispatch();
+    }
+
+    fn handle_connection_established(
+        &mut self,
+        backend_id: BackendId,
+        _ws: crate::backend::BackendWs,
+    ) {
+        // Real implementation lands in Task 8.
+        tracing::debug!(backend = %backend_id, "stub: connection established (drop ws)");
+    }
+
+    fn handle_connection_failed(&mut self, backend_id: BackendId, error: String) {
+        // Real implementation lands in Task 8.
+        tracing::debug!(backend = %backend_id, error = %error, "stub: connection failed");
     }
 
     fn handle_backend_recovered(&mut self, backend_id: BackendId) {

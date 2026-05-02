@@ -1,10 +1,16 @@
 use std::net::SocketAddr;
 
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
 use crate::types::BackendId;
 
 use super::circuit::CircuitBreaker;
 use super::scoring::BackendScoring;
 use super::state::BackendState;
+
+/// The owned WebSocket connection type held in a backend's warm slot.
+pub type BackendWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Represents a single backend worker and all its associated metadata.
 #[derive(Debug)]
