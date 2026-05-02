@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
@@ -7,12 +6,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::backend::BackendWs;
 use crate::dispatch::{ClientEvent, PendingRequest};
 use crate::metrics::Metrics;
 use crate::protocol::backend::BackendMessage;
 use crate::protocol::frame::encode_binary_frame;
 use crate::types::{BackendId, StreamId};
-use tokio_tungstenite::MaybeTlsStream;
 
 /// Outcome of a forwarding attempt.
 #[derive(Debug)]
@@ -25,7 +24,6 @@ pub enum ForwardOutcome {
     BackendHung,
     MalformedResponse(String),
     /// Backend accepted the connection but refused the start (contention).
-    /// Not a failure for circuit/scoring; request should be retried elsewhere.
     BackendBusy,
     BackendError(String),
     ClientGone,
@@ -46,31 +44,38 @@ pub struct ForwardResult {
     pub tried_backends: Vec<BackendId>,
 }
 
-/// Execute a single forwarding attempt: connect to backend, send request,
-/// stream audio chunks back to the client.
+/// Execute a single forwarding attempt using the warm `ws` connection passed in.
 ///
 /// `cancel_rx` lets the dispatcher abort an in-flight stream on client request.
+/// `drain_timeout` bounds the post-terminal read-to-EOF window.
 pub async fn run_forwarding(
     backend_id: BackendId,
-    backend_addr: SocketAddr,
+    mut ws: BackendWs,
     request: PendingRequest,
     hang_timeout: Duration,
+    drain_timeout: Duration,
     cancel_rx: oneshot::Receiver<()>,
     metrics: Arc<Metrics>,
 ) -> ForwardResult {
     let stream_id = request.stream_id.clone();
 
     let outcome = do_forward(
-        backend_addr,
+        &mut ws,
         &stream_id,
         &request.text,
         request.speaker_id,
         &request.client_tx,
         hang_timeout,
+        drain_timeout,
         cancel_rx,
         &metrics,
     )
     .await;
+
+    // ws is dropped here — by this point either drain_close has consumed the
+    // peer's FIN (passive-close path) or the peer never sent FIN (active-close
+    // path: hang/cancel). Either way, the slot is consumed.
+    drop(ws);
 
     ForwardResult {
         backend_id,
@@ -86,37 +91,25 @@ pub async fn run_forwarding(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_forward(
-    backend_addr: SocketAddr,
+    ws: &mut BackendWs,
     stream_id: &StreamId,
     text: &str,
     speaker_id: u32,
     client_tx: &mpsc::Sender<ClientEvent>,
     hang_timeout: Duration,
+    drain_timeout: Duration,
     mut cancel_rx: oneshot::Receiver<()>,
     metrics: &Arc<Metrics>,
 ) -> ForwardOutcome {
-    let url = format!("ws://{}/v1/ws/speech", backend_addr);
-    let connect_timeout = Duration::from_secs(3);
-    let mut ws = tokio::select! {
-        result = tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(&url)) => {
-            match result {
-                Ok(Ok((ws, _))) => ws,
-                Ok(Err(e)) => {
-                    tracing::warn!(backend = %backend_addr, "connect failed: {e}");
-                    return ForwardOutcome::BackendError(format!("connect failed: {e}"));
-                }
-                Err(_) => {
-                    tracing::warn!(backend = %backend_addr, "connect timed out after {connect_timeout:?}");
-                    return ForwardOutcome::BackendError("connect timeout".into());
-                }
-            }
-        }
-        _ = &mut cancel_rx => {
-            return ForwardOutcome::Cancelled;
-        }
-    };
-    nodelay_backend_stream(ws.get_ref());
+    // Liveness check: if the warm slot already has buffered data (pre-start
+    // error from REFUSE chaos, server crashed during the gap, etc.), handle it
+    // before sending start.
+    if let Some(early) = check_warm_slot_liveness(ws).await {
+        drain_close(ws, drain_timeout).await;
+        return early;
+    }
 
     let start_json = serde_json::json!({
         "type": "start",
@@ -127,7 +120,8 @@ async fn do_forward(
         .send(Message::Text(start_json.to_string().into()))
         .await
     {
-        tracing::warn!(backend = %backend_addr, "send start failed: {e}");
+        tracing::warn!("send start failed: {e}");
+        drain_close(ws, drain_timeout).await;
         return ForwardOutcome::BackendCrashed;
     }
 
@@ -138,38 +132,32 @@ async fn do_forward(
         tokio::select! {
             biased;
             _ = &mut cancel_rx => {
-                tracing::debug!(
-                    backend = %backend_addr,
-                    stream = %stream_id,
-                    "stream cancelled, closing backend connection"
-                );
-                let _ = ws.close(None).await;
+                tracing::debug!(stream = %stream_id, "stream cancelled");
+                // Best-effort: try to send WS Close, then short drain. Backend
+                // doesn't support cancel, so we'll likely end as active closer.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    ws.close(None),
+                ).await;
+                drain_close(ws, drain_timeout).await;
                 return ForwardOutcome::Cancelled;
             }
             read = tokio::time::timeout(hang_timeout, ws.next()) => {
                 match read {
                     Err(_elapsed) => {
-                        tracing::warn!(
-                            backend = %backend_addr,
-                            stream = %stream_id,
-                            "hung — no data in {hang_timeout:?}"
-                        );
+                        tracing::warn!(stream = %stream_id, "hung — no data in {hang_timeout:?}");
+                        // No drain — server is sleeping and won't FIN.
                         return ForwardOutcome::BackendHung;
                     }
                     Ok(None) => {
-                        tracing::warn!(
-                            backend = %backend_addr,
-                            stream = %stream_id,
-                            "connection closed without done"
-                        );
+                        tracing::warn!(stream = %stream_id, "connection closed without done");
+                        // Peer already closed; drain is a no-op but cheap.
+                        drain_close(ws, drain_timeout).await;
                         return ForwardOutcome::BackendCrashed;
                     }
                     Ok(Some(Err(e))) => {
-                        tracing::warn!(
-                            backend = %backend_addr,
-                            stream = %stream_id,
-                            "ws error: {e}"
-                        );
+                        tracing::warn!(stream = %stream_id, "ws error: {e}");
+                        drain_close(ws, drain_timeout).await;
                         return ForwardOutcome::BackendCrashed;
                     }
                     Ok(Some(Ok(msg))) => match msg {
@@ -180,15 +168,26 @@ async fn do_forward(
 
                             let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
-                            // Backpressure: wait for client without dropping chunks.
                             tokio::select! {
                                 biased;
                                 _ = &mut cancel_rx => {
-                                    let _ = ws.close(None).await;
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_millis(50),
+                                        ws.close(None),
+                                    ).await;
+                                    drain_close(ws, drain_timeout).await;
                                     return ForwardOutcome::Cancelled;
                                 }
                                 send = client_tx.send(ClientEvent::Binary(tagged)) => {
                                     if send.is_err() {
+                                        // Client gone: backend keeps producing. Drain briefly
+                                        // and drop. Active-close cost on this path is acceptable
+                                        // (rare).
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_millis(50),
+                                            ws.close(None),
+                                        ).await;
+                                        drain_close(ws, drain_timeout).await;
                                         return ForwardOutcome::ClientGone;
                                     }
                                 }
@@ -205,24 +204,27 @@ async fn do_forward(
                                     let ttfc = first_chunk_time
                                         .map(|t| t.duration_since(request_start))
                                         .unwrap_or_default();
-
+                                    drain_close(ws, drain_timeout).await;
                                     return ForwardOutcome::Success {
                                         ttfc,
                                         audio_duration,
                                     };
                                 }
                                 BackendMessage::Error { message } => {
+                                    drain_close(ws, drain_timeout).await;
                                     if message.to_lowercase().contains("busy") {
                                         return ForwardOutcome::BackendBusy;
                                     }
                                     return ForwardOutcome::BackendError(message);
                                 }
                                 BackendMessage::Unknown(raw) => {
+                                    drain_close(ws, drain_timeout).await;
                                     return ForwardOutcome::MalformedResponse(raw);
                                 }
                             }
                         }
                         Message::Close(_) => {
+                            drain_close(ws, drain_timeout).await;
                             return ForwardOutcome::BackendCrashed;
                         }
                         _ => {}
@@ -233,9 +235,43 @@ async fn do_forward(
     }
 }
 
-/// Disable Nagle on the backend TCP connection to avoid small-packet delays on TTFC.
-fn nodelay_backend_stream(stream: &MaybeTlsStream<tokio::net::TcpStream>) {
-    if let MaybeTlsStream::Plain(tcp) = stream {
-        let _ = tcp.set_nodelay(true);
+/// Non-blocking poll of the warm slot before sending start.
+/// Returns Some(outcome) if the connection is dead or has buffered data,
+/// None if Pending (slot is alive — proceed with start).
+async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> {
+    use futures_util::future::poll_immediate;
+    match poll_immediate(ws.next()).await {
+        None => None, // Pending: alive
+        Some(None) => Some(ForwardOutcome::BackendCrashed),
+        Some(Some(Err(_))) => Some(ForwardOutcome::BackendCrashed),
+        Some(Some(Ok(Message::Close(_)))) => Some(ForwardOutcome::BackendCrashed),
+        Some(Some(Ok(Message::Text(t)))) => {
+            let m = BackendMessage::from_text(&t);
+            Some(match m {
+                BackendMessage::Error { message } => {
+                    if message.to_lowercase().contains("busy") {
+                        ForwardOutcome::BackendBusy
+                    } else {
+                        ForwardOutcome::BackendError(message)
+                    }
+                }
+                BackendMessage::Unknown(raw) => ForwardOutcome::MalformedResponse(raw),
+                BackendMessage::Done { .. } | BackendMessage::Queued => {
+                    ForwardOutcome::MalformedResponse(format!("pre-start: {t}"))
+                }
+            })
+        }
+        Some(Some(Ok(_))) => Some(ForwardOutcome::MalformedResponse(
+            "pre-start binary".to_string(),
+        )),
     }
+}
+
+/// Drain reads to EOF (or timeout) so the peer's FIN arrives before our drop
+/// sends ours — making us the passive TCP closer.
+async fn drain_close(ws: &mut BackendWs, deadline: Duration) {
+    let _ = tokio::time::timeout(deadline, async {
+        while ws.next().await.is_some() {}
+    })
+    .await;
 }
