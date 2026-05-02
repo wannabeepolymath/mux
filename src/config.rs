@@ -41,6 +41,15 @@ pub struct CliArgs {
     /// Max retry attempts per request (so total attempts = 1 + max_retries)
     #[arg(long, default_value = "3")]
     pub max_retries: u32,
+
+    /// Connection drain timeout in ms. Bounded read-to-EOF window after
+    /// the terminal frame so the multiplexer ends as the passive TCP closer.
+    #[arg(long, default_value = "100")]
+    pub drain_timeout_ms: u64,
+
+    /// Connect timeout in seconds for backend WebSocket handshake.
+    #[arg(long, default_value = "3")]
+    pub connect_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +63,8 @@ pub struct Config {
     pub max_queue_depth: usize,
     pub max_streams_per_conn: usize,
     pub max_retries: u32,
+    pub drain_timeout: Duration,
+    pub connect_timeout: Duration,
 }
 
 impl Config {
@@ -77,6 +88,8 @@ impl Config {
             max_queue_depth: args.max_queue_depth,
             max_streams_per_conn: args.max_streams_per_conn,
             max_retries: args.max_retries,
+            drain_timeout: Duration::from_millis(args.drain_timeout_ms),
+            connect_timeout: Duration::from_secs(args.connect_timeout_secs),
         })
     }
 }
