@@ -48,6 +48,22 @@ impl BackendConn {
     /// Whether this backend can accept a new request right now.
     /// Requires both a warm slot (state == Ready) and a closed/half-open circuit.
     pub fn is_available(&mut self) -> bool {
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
         self.state.is_ready() && self.conn.is_some() && self.circuit.can_attempt()
+    }
+
+    /// Debug-only check: warm slot must be present iff state is Ready.
+    /// The spec invariant — `conn.is_some() ⇔ state == Ready` — is documented
+    /// in §3.1 of the design doc; this is the runtime guard.
+    #[cfg(debug_assertions)]
+    pub fn assert_invariants(&self) {
+        debug_assert_eq!(
+            self.conn.is_some(),
+            matches!(self.state, BackendState::Ready),
+            "BackendConn invariant violated: conn.is_some()={}, state={:?}",
+            self.conn.is_some(),
+            self.state,
+        );
     }
 }
