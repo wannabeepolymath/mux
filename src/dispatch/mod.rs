@@ -136,6 +136,16 @@ impl Dispatcher {
 
     /// Run the dispatcher event loop. Blocks until shutdown or all senders drop.
     pub async fn run(mut self) {
+        // Kick off initial connect for every backend.
+        for backend in &mut self.backends {
+            backend.state = BackendState::Connecting;
+            self.metrics
+                .set_backend_state(&backend.addr.to_string(), backend.state.name());
+        }
+        for i in 0..self.backends.len() {
+            self.spawn_connect(BackendId(i));
+        }
+
         tracing::info!("dispatcher started with {} backends", self.backends.len());
 
         while let Some(event) = self.dispatch_rx.recv().await {
@@ -215,15 +225,18 @@ impl Dispatcher {
                     .with_label_values(&["success"])
                     .inc();
 
-                let backend = &mut self.backends[backend_idx];
-                backend.scoring.record_ttfc(ttfc.as_secs_f64() * 1000.0);
-                backend.scoring.record_result(true);
-                backend.circuit.record_success();
-                backend.state = BackendState::Ready;
-                self.metrics
-                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
-                self.active_streams = self.active_streams.saturating_sub(1);
-                self.metrics.active_streams.set(self.active_streams as i64);
+                {
+                    let backend = &mut self.backends[backend_idx];
+                    backend.scoring.record_ttfc(ttfc.as_secs_f64() * 1000.0);
+                    backend.scoring.record_result(true);
+                    backend.circuit.record_success();
+                    backend.state = BackendState::Disconnected;
+                    backend.conn = None;
+                    self.metrics
+                        .set_backend_state(&backend.addr.to_string(), backend.state.name());
+                    self.active_streams = self.active_streams.saturating_sub(1);
+                    self.metrics.active_streams.set(self.active_streams as i64);
+                }
 
                 let elapsed = result.created_at.elapsed();
                 let total_time = elapsed.as_secs_f64();
@@ -251,15 +264,20 @@ impl Dispatcher {
                     ttfc_ms = ttfc.as_millis(),
                     "stream completed"
                 );
+
+                self.spawn_reconnect_if_circuit_allows(result.backend_id);
             }
 
             ForwardOutcome::BackendBusy => {
-                let backend = &mut self.backends[backend_idx];
-                backend.state = BackendState::Ready;
-                self.metrics
-                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
-                self.active_streams = self.active_streams.saturating_sub(1);
-                self.metrics.active_streams.set(self.active_streams as i64);
+                {
+                    let backend = &mut self.backends[backend_idx];
+                    backend.state = BackendState::Disconnected;
+                    backend.conn = None;
+                    self.metrics
+                        .set_backend_state(&backend.addr.to_string(), backend.state.name());
+                    self.active_streams = self.active_streams.saturating_sub(1);
+                    self.metrics.active_streams.set(self.active_streams as i64);
+                }
 
                 tracing::debug!(
                     stream = %result.stream_id,
@@ -283,31 +301,29 @@ impl Dispatcher {
                 };
                 let _ = self.queue.push_front(retry);
                 self.metrics.queue_depth.set(self.queue.len() as i64);
+
+                self.spawn_reconnect_if_circuit_allows(result.backend_id);
             }
 
             ForwardOutcome::BackendCrashed
             | ForwardOutcome::BackendHung
             | ForwardOutcome::MalformedResponse(_)
             | ForwardOutcome::BackendError(_) => {
-                let backend = &mut self.backends[backend_idx];
-                backend.scoring.record_result(false);
-                let penalty_ms = self.config.hang_timeout.as_secs_f64() * 1000.0;
-                backend.scoring.record_ttfc(penalty_ms);
-                backend.circuit.record_failure();
-                // Don't mark Ready immediately — cooldown prevents retries
-                // hitting the same (possibly still-hung) backend.
-                backend.state = BackendState::Disconnected;
-                self.metrics
-                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
-                self.active_streams = self.active_streams.saturating_sub(1);
-                self.metrics.active_streams.set(self.active_streams as i64);
-
-                let dispatch_tx = self.dispatch_tx.clone();
-                let bid = result.backend_id;
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let _ = dispatch_tx.send(DispatchEvent::BackendRecovered(bid)).await;
-                });
+                {
+                    let backend = &mut self.backends[backend_idx];
+                    backend.scoring.record_result(false);
+                    let penalty_ms = self.config.hang_timeout.as_secs_f64() * 1000.0;
+                    backend.scoring.record_ttfc(penalty_ms);
+                    backend.circuit.record_failure();
+                    // Don't mark Ready immediately — cooldown prevents retries
+                    // hitting the same (possibly still-hung) backend.
+                    backend.state = BackendState::Disconnected;
+                    backend.conn = None;
+                    self.metrics
+                        .set_backend_state(&backend.addr.to_string(), backend.state.name());
+                    self.active_streams = self.active_streams.saturating_sub(1);
+                    self.metrics.active_streams.set(self.active_streams as i64);
+                }
 
                 let reason = match &result.outcome {
                     ForwardOutcome::BackendCrashed => "crashed".to_string(),
@@ -363,39 +379,48 @@ impl Dispatcher {
                         .client_tx
                         .try_send(ClientEvent::Text(err.to_json()));
                 }
+
+                self.spawn_reconnect_after_failure(result.backend_id);
             }
 
             ForwardOutcome::ClientGone => {
-                let backend = &mut self.backends[backend_idx];
-                backend.state = BackendState::Ready;
-                self.metrics
-                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
-                self.active_streams = self.active_streams.saturating_sub(1);
-                self.metrics.active_streams.set(self.active_streams as i64);
+                {
+                    let backend = &mut self.backends[backend_idx];
+                    backend.state = BackendState::Disconnected;
+                    backend.conn = None;
+                    self.metrics
+                        .set_backend_state(&backend.addr.to_string(), backend.state.name());
+                    self.active_streams = self.active_streams.saturating_sub(1);
+                    self.metrics.active_streams.set(self.active_streams as i64);
+                }
                 result.active_count.fetch_sub(1, Ordering::Relaxed);
                 tracing::debug!(
                     stream = %result.stream_id,
                     backend = %result.backend_id,
                     "client gone, released backend"
                 );
+                self.spawn_reconnect_if_circuit_allows(result.backend_id);
             }
 
             ForwardOutcome::Cancelled => {
                 // Client-initiated cancellation. Don't penalize the backend.
-                // The backend connection has been closed; mark Ready so it can
-                // accept the next dispatch (a fresh connection will be opened).
-                let backend = &mut self.backends[backend_idx];
-                backend.state = BackendState::Ready;
-                self.metrics
-                    .set_backend_state(&backend.addr.to_string(), backend.state.name());
-                self.active_streams = self.active_streams.saturating_sub(1);
-                self.metrics.active_streams.set(self.active_streams as i64);
+                // The backend connection has been consumed; reconnect.
+                {
+                    let backend = &mut self.backends[backend_idx];
+                    backend.state = BackendState::Disconnected;
+                    backend.conn = None;
+                    self.metrics
+                        .set_backend_state(&backend.addr.to_string(), backend.state.name());
+                    self.active_streams = self.active_streams.saturating_sub(1);
+                    self.metrics.active_streams.set(self.active_streams as i64);
+                }
                 result.active_count.fetch_sub(1, Ordering::Relaxed);
                 tracing::debug!(
                     stream = %result.stream_id,
                     backend = %result.backend_id,
                     "stream cancelled, released backend"
                 );
+                self.spawn_reconnect_if_circuit_allows(result.backend_id);
             }
         }
 
@@ -405,25 +430,59 @@ impl Dispatcher {
     fn handle_connection_established(
         &mut self,
         backend_id: BackendId,
-        _ws: crate::backend::BackendWs,
+        ws: crate::backend::BackendWs,
     ) {
-        // Real implementation lands in Task 8.
-        tracing::debug!(backend = %backend_id, "stub: connection established (drop ws)");
+        let backend = &mut self.backends[backend_id.0];
+        backend.conn = Some(ws);
+        backend.state = BackendState::Ready;
+        backend.reconnect_attempt = 0;
+        self.metrics
+            .set_backend_state(&backend.addr.to_string(), backend.state.name());
+        tracing::debug!(backend = %backend_id, "connection ready (warm slot)");
+        self.try_dispatch();
     }
 
     fn handle_connection_failed(&mut self, backend_id: BackendId, error: String) {
-        // Real implementation lands in Task 8.
-        tracing::debug!(backend = %backend_id, error = %error, "stub: connection failed");
+        {
+            let backend = &mut self.backends[backend_id.0];
+            backend.state = BackendState::Disconnected;
+            backend.conn = None;
+            backend.reconnect_attempt = backend.reconnect_attempt.saturating_add(1);
+            self.metrics
+                .set_backend_state(&backend.addr.to_string(), backend.state.name());
+            tracing::warn!(
+                backend = %backend_id,
+                attempt = backend.reconnect_attempt,
+                error = %error,
+                "connect failed; will retry with backoff"
+            );
+        }
+
+        // If circuit is open, do not respawn — wait for BackendRecovered.
+        let circuit_open = !self.backends[backend_id.0].circuit.can_attempt();
+        if circuit_open {
+            tracing::debug!(backend = %backend_id, "circuit open; deferring reconnect");
+            return;
+        }
+
+        self.backends[backend_id.0].state = BackendState::Connecting;
+        self.metrics.set_backend_state(
+            &self.backends[backend_id.0].addr.to_string(),
+            self.backends[backend_id.0].state.name(),
+        );
+        self.spawn_connect(backend_id);
     }
 
     fn handle_backend_recovered(&mut self, backend_id: BackendId) {
         let backend = &mut self.backends[backend_id.0];
         if matches!(backend.state, BackendState::Disconnected) {
-            backend.state = BackendState::Ready;
-            self.metrics
-                .set_backend_state(&backend.addr.to_string(), backend.state.name());
-            tracing::debug!(backend = %backend_id, "backend recovered after cooldown");
-            self.try_dispatch();
+            backend.state = BackendState::Connecting;
+            let addr_str = backend.addr.to_string();
+            self.metrics.set_backend_state(&addr_str, backend.state.name());
+            tracing::debug!(backend = %backend_id, "backend recovered; reconnecting");
+            // Important: do not hold &mut backend across the spawn_connect call,
+            // since spawn_connect borrows &self.backends.
+            self.spawn_connect(backend_id);
         }
     }
 
@@ -486,15 +545,30 @@ impl Dispatcher {
 
     fn dispatch_to(&mut self, backend_id: BackendId, req: PendingRequest) {
         let backend_addr_str = self.backends[backend_id.0].addr.to_string();
+        let ws = match self.backends[backend_id.0].conn.take() {
+            Some(ws) => ws,
+            None => {
+                // Defensive: try_dispatch should have filtered via is_available()
+                // which checks conn.is_some(). If we're here, log and skip.
+                tracing::error!(
+                    backend = %backend_id,
+                    "dispatch_to called but no warm slot — re-queueing"
+                );
+                let _ = self.queue.push_front(req);
+                self.metrics.queue_depth.set(self.queue.len() as i64);
+                return;
+            }
+        };
+
         self.backends[backend_id.0].state = BackendState::Busy;
         self.metrics
             .set_backend_state(&backend_addr_str, self.backends[backend_id.0].state.name());
         self.active_streams += 1;
         self.metrics.active_streams.set(self.active_streams as i64);
 
-        let backend_addr = self.backends[backend_id.0].addr;
         let dispatch_tx = self.dispatch_tx.clone();
         let hang_timeout = self.config.hang_timeout;
+        let drain_timeout = self.config.drain_timeout;
         let metrics = self.metrics.clone();
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -509,9 +583,10 @@ impl Dispatcher {
         tokio::spawn(async move {
             let result = forward::run_forwarding(
                 backend_id,
-                backend_addr,
+                ws,
                 req,
                 hang_timeout,
+                drain_timeout,
                 cancel_rx,
                 metrics,
             )
@@ -584,6 +659,46 @@ impl Dispatcher {
         }
 
         best.map(|(id, _)| id)
+    }
+
+    /// Spawn a connect task for the given backend with the current attempt
+    /// counter. Caller is responsible for setting state to Connecting.
+    fn spawn_connect(&self, backend_id: BackendId) {
+        let addr = self.backends[backend_id.0].addr;
+        let attempt = self.backends[backend_id.0].reconnect_attempt;
+        let dispatch_tx = self.dispatch_tx.clone();
+        let connect_timeout = self.config.connect_timeout;
+        tokio::spawn(crate::dispatch::connect::connect_task(
+            addr,
+            backend_id,
+            dispatch_tx,
+            connect_timeout,
+            attempt,
+        ));
+    }
+
+    /// Transition backend to Connecting and spawn connect_task, but only if
+    /// the circuit is closed/half-open. If circuit is open, leave the backend
+    /// Disconnected — Task 9's cooldown timer will revive it via BackendRecovered.
+    fn spawn_reconnect_if_circuit_allows(&mut self, backend_id: BackendId) {
+        let circuit_open = !self.backends[backend_id.0].circuit.can_attempt();
+        if circuit_open {
+            tracing::debug!(backend = %backend_id, "circuit open; not reconnecting");
+            return;
+        }
+        self.backends[backend_id.0].state = BackendState::Connecting;
+        self.metrics.set_backend_state(
+            &self.backends[backend_id.0].addr.to_string(),
+            self.backends[backend_id.0].state.name(),
+        );
+        self.spawn_connect(backend_id);
+    }
+
+    /// Same as spawn_reconnect_if_circuit_allows for now. Task 9 will modify this
+    /// to additionally schedule the circuit-cooldown timer when the circuit
+    /// just opened on this failure.
+    fn spawn_reconnect_after_failure(&mut self, backend_id: BackendId) {
+        self.spawn_reconnect_if_circuit_allows(backend_id);
     }
 
     /// Build a snapshot of the dispatcher's state for the /health endpoint.
