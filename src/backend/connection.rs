@@ -20,6 +20,11 @@ pub struct BackendConn {
     pub state: BackendState,
     pub circuit: CircuitBreaker,
     pub scoring: BackendScoring,
+    /// Warm WebSocket connection. Populated iff `state == Ready`.
+    pub conn: Option<BackendWs>,
+    /// Consecutive failed connect attempts; drives backoff schedule.
+    /// Reset to 0 on every successful ConnectionEstablished.
+    pub reconnect_attempt: u32,
 }
 
 impl BackendConn {
@@ -35,11 +40,14 @@ impl BackendConn {
             state: BackendState::Disconnected,
             circuit: CircuitBreaker::new(circuit_threshold, circuit_cooldown),
             scoring: BackendScoring::new(),
+            conn: None,
+            reconnect_attempt: 0,
         }
     }
 
     /// Whether this backend can accept a new request right now.
+    /// Requires both a warm slot (state == Ready) and a closed/half-open circuit.
     pub fn is_available(&mut self) -> bool {
-        self.state.is_ready() && self.circuit.can_attempt()
+        self.state.is_ready() && self.conn.is_some() && self.circuit.can_attempt()
     }
 }

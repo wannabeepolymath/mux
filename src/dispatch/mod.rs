@@ -101,14 +101,12 @@ impl Dispatcher {
             .iter()
             .enumerate()
             .map(|(i, &addr)| {
-                let mut conn = BackendConn::new(
+                BackendConn::new(
                     BackendId(i),
                     addr,
                     config.circuit_threshold,
                     config.circuit_cooldown,
-                );
-                conn.state = BackendState::Ready;
-                conn
+                )
             })
             .collect();
 
