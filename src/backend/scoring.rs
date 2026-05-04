@@ -106,6 +106,23 @@ mod tests {
     }
 
     #[test]
+    fn record_result_does_not_touch_ttfc_ewma() {
+        // Guard: TTFC EWMA must stay strictly tied to successful-stream
+        // timing. record_result() (success or failure) updates the error-rate
+        // window only — not the latency signal.
+        let mut s = BackendScoring::new();
+        s.record_ttfc(120.0);
+        let baseline = s.ttfc_ewma_ms();
+        for _ in 0..10 {
+            s.record_result(false);
+        }
+        for _ in 0..10 {
+            s.record_result(true);
+        }
+        assert_eq!(s.ttfc_ewma_ms(), baseline);
+    }
+
+    #[test]
     fn sliding_window_evicts() {
         let mut s = BackendScoring::new();
         // Fill window with failures

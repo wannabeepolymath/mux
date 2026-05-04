@@ -311,9 +311,12 @@ impl Dispatcher {
             | ForwardOutcome::BackendError(_) => {
                 let circuit_just_opened = {
                     let backend = &mut self.backends[backend_idx];
+                    // Record the failure for error_rate (the risk signal). Do
+                    // NOT feed a synthetic TTFC penalty here: TTFC EWMA is
+                    // strictly successful-stream timing. Polluting it with the
+                    // hang_timeout convergeed every backend's score to ~5000ms
+                    // and broke adaptive routing.
                     backend.scoring.record_result(false);
-                    let penalty_ms = self.config.hang_timeout.as_secs_f64() * 1000.0;
-                    backend.scoring.record_ttfc(penalty_ms);
                     let was_closed_or_half_open = backend.circuit.can_attempt();
                     backend.circuit.record_failure();
                     let just_opened = was_closed_or_half_open
