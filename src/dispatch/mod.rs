@@ -486,24 +486,55 @@ impl Dispatcher {
     }
 
     fn handle_connection_failed(&mut self, backend_id: BackendId, error: String) {
+        // Three cases for the connect failure:
+        //  (a) Circuit was Closed: normal connect failure → respawn with backoff.
+        //  (b) Circuit was Open and cooldown not yet elapsed: stale connect from
+        //      before the circuit opened → defer; BackendRecovered will run the
+        //      real probe later.
+        //  (c) Circuit was Open and cooldown elapsed: this connect WAS the
+        //      recovery probe → bump consecutive_opens, reschedule the cooldown
+        //      timer with the next (longer) cooldown. Do not retry connect.
+        let was_probe = self.backends[backend_id.0].circuit.cooldown_elapsed();
+        let circuit_open = matches!(
+            self.backends[backend_id.0].circuit.state(),
+            crate::backend::circuit::CircuitState::Open,
+        );
+
         {
             let backend = &mut self.backends[backend_id.0];
             backend.state = BackendState::Disconnected;
             backend.conn = None;
-            backend.reconnect_attempt = backend.reconnect_attempt.saturating_add(1);
+            // Don't bump connect-backoff for probe failures: cooldown timer is
+            // the backoff for that path.
+            if !was_probe {
+                backend.reconnect_attempt = backend.reconnect_attempt.saturating_add(1);
+            }
             self.metrics
                 .set_backend_state(&backend.addr.to_string(), backend.state.name());
             tracing::warn!(
                 backend = %backend_id,
                 attempt = backend.reconnect_attempt,
                 error = %error,
-                "connect failed; will retry with backoff"
+                probe = was_probe,
+                "connect failed",
             );
         }
 
-        // If circuit is open, do not respawn — wait for BackendRecovered.
-        let circuit_open = !self.backends[backend_id.0].circuit.can_attempt();
+        if was_probe {
+            let backend = &mut self.backends[backend_id.0];
+            backend.circuit.record_open_failure();
+            let cooldown = backend.circuit.current_cooldown();
+            tracing::info!(
+                backend = %backend_id,
+                cooldown = ?cooldown,
+                "circuit probe failed; rescheduling recovery timer",
+            );
+            self.spawn_circuit_cooldown_timer(backend_id);
+            return;
+        }
+
         if circuit_open {
+            // Stale connect that landed during an active cooldown. Defer.
             tracing::debug!(backend = %backend_id, "circuit open; deferring reconnect");
             return;
         }
@@ -742,12 +773,13 @@ impl Dispatcher {
         self.spawn_reconnect_if_circuit_allows(backend_id);
     }
 
-    /// One-shot timer: when a backend's circuit just opened, schedule a
-    /// BackendRecovered event after the cooldown elapses so the dispatcher
-    /// can transition it back to Connecting.
+    /// One-shot timer: when a backend's circuit just opened (or reopened from
+    /// a failed probe), schedule a BackendRecovered event after the *current*
+    /// circuit cooldown elapses. The cooldown is read off the breaker so it
+    /// reflects the exponential schedule (longer on each consecutive open).
     fn spawn_circuit_cooldown_timer(&self, backend_id: BackendId) {
         let dispatch_tx = self.dispatch_tx.clone();
-        let cooldown = self.config.circuit_cooldown;
+        let cooldown = self.backends[backend_id.0].circuit.current_cooldown();
         tokio::spawn(async move {
             tokio::time::sleep(cooldown).await;
             let _ = dispatch_tx
