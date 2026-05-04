@@ -18,8 +18,14 @@ pub struct CliArgs {
     #[arg(long, value_delimiter = ',', required = true)]
     pub backends: Vec<String>,
 
-    /// Hang detection timeout in seconds
-    #[arg(long, default_value = "5")]
+    /// Hang detection timeout in seconds. Spec default is 5s, but at 5s
+    /// every hung backend wastes a full hang-window per attempt. Slow-chaos
+    /// chunk intervals can stretch to ~1.95s, so anything below ~2.5s
+    /// false-triggers under load (verified empirically: 2s flagged ~28
+    /// extra "hangs" out of 40 in a chaos run, mostly slow chunks).
+    /// 3s gives ~1s margin above the slow tail while cutting hang penalty
+    /// 40% vs the 5s spec default.
+    #[arg(long, default_value = "3")]
     pub hang_timeout_secs: u64,
 
     /// Circuit breaker consecutive failure threshold
