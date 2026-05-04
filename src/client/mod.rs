@@ -1,18 +1,22 @@
+pub mod streams;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::Config;
-use crate::dispatch::{ClientEvent, DispatchEvent, PendingRequest};
+use crate::dispatch::{DispatchEvent, PendingRequest};
 use crate::metrics::Metrics;
 use crate::protocol::client::ClientMessage;
 use crate::types::StreamId;
+
+pub use streams::{ClientEvent, ClientStreams};
 
 /// Handle a single client WebSocket connection.
 pub async fn handle_client(
@@ -24,10 +28,9 @@ pub async fn handle_client(
 ) {
     metrics.active_connections.inc();
     let (ws_sink, mut ws_stream) = ws.split();
-    // Large enough for many concurrent streams × chunks without try_send loss.
-    let (client_tx, client_rx) = mpsc::channel::<ClientEvent>(4096);
 
-    let writer_handle = tokio::spawn(client_writer(ws_sink, client_rx));
+    let client_streams = Arc::new(ClientStreams::new(config.max_buffer_bytes_per_stream));
+    let writer_handle = tokio::spawn(client_streams.clone().run_writer(ws_sink));
 
     tracing::debug!(client = %client_addr, "client connected");
 
@@ -53,7 +56,10 @@ pub async fn handle_client(
                             "stream_id": "",
                             "message": format!("invalid message: {e}"),
                         });
-                        let _ = client_tx.try_send(ClientEvent::Text(err_json.to_string()));
+                        let _ = client_streams.enqueue(
+                            &StreamId(String::new()),
+                            ClientEvent::Text(err_json.to_string()),
+                        );
                         continue;
                     }
                 };
@@ -74,8 +80,10 @@ pub async fn handle_client(
                                     config.max_streams_per_conn
                                 ),
                             });
-                            let _ =
-                                client_tx.try_send(ClientEvent::Text(err_json.to_string()));
+                            let _ = client_streams.enqueue(
+                                &StreamId(stream_id),
+                                ClientEvent::Text(err_json.to_string()),
+                            );
                             continue;
                         }
 
@@ -85,7 +93,7 @@ pub async fn handle_client(
                             stream_id: StreamId(stream_id),
                             text,
                             speaker_id,
-                            client_tx: client_tx.clone(),
+                            client_streams: client_streams.clone(),
                             retries_remaining: config.max_retries,
                             created_at: Instant::now(),
                             active_count: active_count.clone(),
@@ -124,26 +132,8 @@ pub async fn handle_client(
         }
     }
 
-    drop(client_tx);
+    client_streams.close();
     let _ = writer_handle.await;
     metrics.active_connections.dec();
     tracing::debug!(client = %client_addr, "client handler finished");
-}
-
-/// Dedicated writer task: reads ClientEvents and sends them over the WebSocket.
-async fn client_writer(
-    mut sink: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
-    mut rx: mpsc::Receiver<ClientEvent>,
-) {
-    while let Some(event) = rx.recv().await {
-        let msg = match event {
-            ClientEvent::Text(text) => Message::Text(text.into()),
-            ClientEvent::Binary(data) => Message::Binary(data),
-        };
-
-        if let Err(e) = sink.send(msg).await {
-            tracing::debug!("client write error: {e}");
-            break;
-        }
-    }
 }

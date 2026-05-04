@@ -3,11 +3,12 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::backend::BackendWs;
-use crate::dispatch::{ClientEvent, PendingRequest};
+use crate::client::{ClientEvent, ClientStreams};
+use crate::dispatch::PendingRequest;
 use crate::metrics::Metrics;
 use crate::protocol::backend::BackendMessage;
 use crate::protocol::frame::encode_binary_frame;
@@ -35,7 +36,7 @@ pub struct ForwardResult {
     pub backend_id: BackendId,
     pub stream_id: StreamId,
     pub outcome: ForwardOutcome,
-    pub client_tx: mpsc::Sender<ClientEvent>,
+    pub client_streams: Arc<ClientStreams>,
     pub text: String,
     pub speaker_id: u32,
     pub retries_remaining: u32,
@@ -70,7 +71,7 @@ pub async fn run_forwarding(
         &stream_id,
         &request.text,
         request.speaker_id,
-        &request.client_tx,
+        &request.client_streams,
         hang_timeout,
         cancel_rx,
         &metrics,
@@ -87,7 +88,7 @@ pub async fn run_forwarding(
         backend_id,
         stream_id,
         outcome,
-        client_tx: request.client_tx,
+        client_streams: request.client_streams,
         text: request.text,
         speaker_id: request.speaker_id,
         retries_remaining: request.retries_remaining,
@@ -142,7 +143,7 @@ async fn do_forward(
     stream_id: &StreamId,
     text: &str,
     speaker_id: u32,
-    client_tx: &mpsc::Sender<ClientEvent>,
+    client_streams: &Arc<ClientStreams>,
     hang_timeout: Duration,
     mut cancel_rx: oneshot::Receiver<()>,
     metrics: &Arc<Metrics>,
@@ -199,16 +200,15 @@ async fn do_forward(
 
                             let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
-                            tokio::select! {
-                                biased;
-                                _ = &mut cancel_rx => {
-                                    return ForwardOutcome::Cancelled;
-                                }
-                                send = client_tx.send(ClientEvent::Binary(tagged)) => {
-                                    if send.is_err() {
-                                        return ForwardOutcome::ClientGone;
-                                    }
-                                }
+                            // enqueue is non-blocking: it pushes into the
+                            // per-stream queue with drop-oldest semantics.
+                            // The only reason it can fail is if the client
+                            // disconnected.
+                            if client_streams
+                                .enqueue(stream_id, ClientEvent::Binary(tagged))
+                                .is_err()
+                            {
+                                return ForwardOutcome::ClientGone;
                             }
                             metrics
                                 .chunk_forward_seconds
@@ -251,7 +251,8 @@ async fn do_forward(
 
 /// Non-blocking poll of the warm slot before sending start.
 /// Returns Some(outcome) if the connection is dead or has buffered data,
-/// None if Pending (slot is alive — proceed with start).
+/// None if Pending or only carries control frames (slot is alive — proceed
+/// with start).
 async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> {
     use futures_util::future::poll_immediate;
     match poll_immediate(ws.next()).await {
@@ -259,6 +260,10 @@ async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> 
         Some(None) => Some(ForwardOutcome::BackendCrashed),
         Some(Some(Err(_))) => Some(ForwardOutcome::BackendCrashed),
         Some(Some(Ok(Message::Close(_)))) => Some(ForwardOutcome::BackendCrashed),
+        // WebSocket control frames — the peer (or tokio-tungstenite's keepalive
+        // path) may surface Ping/Pong on an idle warm slot. They are not data
+        // and don't indicate a bad backend; treat as alive.
+        Some(Some(Ok(Message::Ping(_)))) | Some(Some(Ok(Message::Pong(_)))) => None,
         Some(Some(Ok(Message::Text(t)))) => {
             let m = BackendMessage::from_text(&t);
             Some(match m {

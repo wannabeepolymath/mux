@@ -58,6 +58,12 @@ pub struct CliArgs {
     /// Connect timeout in seconds for backend WebSocket handshake.
     #[arg(long, default_value = "3")]
     pub connect_timeout_secs: u64,
+
+    /// Maximum bytes buffered per stream in the per-client output queue.
+    /// When exceeded, oldest binary chunks are dropped (text control frames
+    /// are preserved). Spec default 256 KiB.
+    #[arg(long, default_value = "262144")]
+    pub max_buffer_bytes_per_stream: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +79,7 @@ pub struct Config {
     pub max_retries: u32,
     pub drain_timeout: Duration,
     pub connect_timeout: Duration,
+    pub max_buffer_bytes_per_stream: usize,
 }
 
 impl Config {
@@ -98,6 +105,7 @@ impl Config {
             max_retries: args.max_retries,
             drain_timeout: Duration::from_millis(args.drain_timeout_ms),
             connect_timeout: Duration::from_secs(args.connect_timeout_secs),
+            max_buffer_bytes_per_stream: args.max_buffer_bytes_per_stream,
         })
     }
 }
