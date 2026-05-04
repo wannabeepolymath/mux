@@ -2,11 +2,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio_tungstenite::MaybeTlsStream;
 
-use super::DispatchEvent;
-use crate::types::BackendId;
+use crate::backend::BackendWs;
 
 /// Compute the reconnect backoff for a given attempt number.
 ///
@@ -39,8 +37,6 @@ fn jitter_pct(center_ms: u64, pct: u64) -> i64 {
     if max == 0 {
         return 0;
     }
-    // Cheap pseudo-random based on nanos (good enough for jitter — we don't
-    // need cryptographic quality here).
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as i64)
@@ -48,51 +44,25 @@ fn jitter_pct(center_ms: u64, pct: u64) -> i64 {
     (nanos % (2 * max + 1)) - max
 }
 
-/// Open a WebSocket connection to a backend, then send either
-/// ConnectionEstablished or ConnectionFailed back to the dispatcher.
+/// Open a WebSocket connection to a backend. Returns the warm WS or a
+/// short error string. Disables Nagle for low TTFC.
 ///
-/// `attempt` controls the backoff delay (0 = immediate, higher = exponential).
-pub async fn connect_task(
+/// Used by the per-backend lifecycle task; backoff scheduling is the
+/// caller's responsibility.
+pub async fn connect_once(
     addr: SocketAddr,
-    backend_id: BackendId,
-    dispatch_tx: mpsc::Sender<DispatchEvent>,
-    connect_timeout: std::time::Duration,
-    attempt: u32,
-) {
-    let backoff = backoff_for_attempt(attempt);
-    if !backoff.is_zero() {
-        tokio::time::sleep(backoff).await;
-    }
-
+    connect_timeout: Duration,
+) -> Result<BackendWs, String> {
     let url = format!("ws://{addr}/v1/ws/speech");
-
     let result =
         tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(&url)).await;
-
     match result {
         Ok(Ok((ws, _resp))) => {
-            // Disable Nagle for low TTFC.
             nodelay_backend_stream(ws.get_ref());
-            let _ = dispatch_tx
-                .send(DispatchEvent::ConnectionEstablished { backend_id, ws })
-                .await;
+            Ok(ws)
         }
-        Ok(Err(e)) => {
-            let _ = dispatch_tx
-                .send(DispatchEvent::ConnectionFailed {
-                    backend_id,
-                    error: format!("connect: {e}"),
-                })
-                .await;
-        }
-        Err(_) => {
-            let _ = dispatch_tx
-                .send(DispatchEvent::ConnectionFailed {
-                    backend_id,
-                    error: "connect timeout".into(),
-                })
-                .await;
-        }
+        Ok(Err(e)) => Err(format!("connect: {e}")),
+        Err(_) => Err("connect timeout".into()),
     }
 }
 
@@ -113,8 +83,6 @@ mod tests {
 
     #[test]
     fn schedule_is_monotonic_at_center() {
-        // Compare a small backoff with a larger one over many samples;
-        // statistical: the larger one should be larger more often than not.
         let mut larger_count = 0;
         let trials = 100;
         for _ in 0..trials {
@@ -123,7 +91,6 @@ mod tests {
             if large > small {
                 larger_count += 1;
             }
-            // Tiny sleep so jitter source advances.
             std::thread::sleep(Duration::from_micros(50));
         }
         assert!(
@@ -134,7 +101,6 @@ mod tests {
 
     #[test]
     fn caps_at_five_seconds_plus_jitter() {
-        // Even at attempt 100, must not exceed 5000ms + 25% jitter = 6250ms.
         for _ in 0..50 {
             let b = backoff_for_attempt(100);
             assert!(
@@ -152,7 +118,6 @@ mod tests {
     fn jitter_within_bounds() {
         for _ in 0..50 {
             let b = backoff_for_attempt(2);
-            // center 250ms ± 25% = [187, 312]
             assert!(
                 b >= Duration::from_millis(187) && b <= Duration::from_millis(313),
                 "attempt 2 backoff {b:?} outside [187, 313]",

@@ -28,10 +28,6 @@ pub enum BackendState {
 }
 
 impl BackendState {
-    pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready)
-    }
-
     pub fn name(&self) -> &'static str {
         match self {
             Self::Connecting => "connecting",

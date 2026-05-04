@@ -3,10 +3,11 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::backend::BackendWs;
+use crate::backend::shard::{BackendOutcome, LifecycleEvent};
 use crate::client::{ClientEvent, ClientStreams};
 use crate::dispatch::PendingRequest;
 use crate::metrics::Metrics;
@@ -31,6 +32,26 @@ pub enum ForwardOutcome {
     Cancelled,
 }
 
+impl ForwardOutcome {
+    /// Translate the outcome into the slimmer per-backend signal that the
+    /// lifecycle task uses to update scoring/circuit/state.
+    fn to_backend_outcome(&self) -> BackendOutcome {
+        match self {
+            ForwardOutcome::Success { ttfc, .. } => BackendOutcome::Success {
+                ttfc_ms: ttfc.as_secs_f64() * 1000.0,
+            },
+            ForwardOutcome::BackendCrashed
+            | ForwardOutcome::BackendHung
+            | ForwardOutcome::MalformedResponse(_)
+            | ForwardOutcome::BackendError(_) => BackendOutcome::Failure,
+            ForwardOutcome::BackendBusy => BackendOutcome::Busy,
+            ForwardOutcome::ClientGone | ForwardOutcome::Cancelled => {
+                BackendOutcome::ClientGoneOrCancel
+            }
+        }
+    }
+}
+
 /// Full result returned to the Dispatcher, carrying request data back for retries.
 pub struct ForwardResult {
     pub backend_id: BackendId,
@@ -47,14 +68,14 @@ pub struct ForwardResult {
 
 /// Execute a single forwarding attempt using the warm `ws` connection passed in.
 ///
-/// `cancel_rx` lets the dispatcher abort an in-flight stream on client request.
-/// `drain_timeout` bounds the post-terminal read-to-EOF window.
-///
-/// On any terminal outcome, this function returns the `ForwardResult` to the
-/// caller *immediately* and spawns a detached task to handle TCP cleanup
-/// (drain to EOF + drop). The dispatcher learns about the completion without
-/// waiting for the cleanup tail — this removes ~drain_timeout (default 100ms)
-/// of "backend dark time" before reconnect can begin.
+/// On any terminal outcome:
+///   1. Spawn a detached cleanup task for the WS (drain, active-close, or drop
+///      depending on outcome).
+///   2. Send a `LifecycleEvent::ForwardDone(...)` to the per-backend lifecycle
+///      task so it can update scoring/circuit and reconnect.
+///   3. Return a `ForwardResult` to the caller (the dispatch task that spawned
+///      us). The caller is responsible for sending it on as
+///      `DispatchEvent::StreamCompleted`.
 pub async fn run_forwarding(
     backend_id: BackendId,
     mut ws: BackendWs,
@@ -63,6 +84,7 @@ pub async fn run_forwarding(
     drain_timeout: Duration,
     cancel_rx: oneshot::Receiver<()>,
     metrics: Arc<Metrics>,
+    lifecycle_tx: mpsc::Sender<LifecycleEvent>,
 ) -> ForwardResult {
     let stream_id = request.stream_id.clone();
 
@@ -78,11 +100,21 @@ pub async fn run_forwarding(
     )
     .await;
 
-    // Decide on cleanup style based on outcome, then detach. The drain has
-    // no semantic role in the request flow — it's purely TCP hygiene
-    // (consume peer's FIN before sending our own = passive closer).
+    // Detach TCP cleanup so the dispatcher learns of completion immediately.
     let cleanup = cleanup_kind(&outcome);
     spawn_ws_cleanup(ws, drain_timeout, cleanup);
+
+    // Notify the per-backend lifecycle task (single writer for backend state).
+    // try_send because the lifecycle channel is bounded and we don't want to
+    // back-pressure the forward task; in the worst case we block briefly on
+    // the await fallback.
+    let backend_outcome = outcome.to_backend_outcome();
+    if let Err(mpsc::error::TrySendError::Full(ev)) =
+        lifecycle_tx.try_send(LifecycleEvent::ForwardDone(backend_outcome))
+    {
+        // Channel full (rare). Fall back to await to ensure delivery.
+        let _ = lifecycle_tx.send(ev).await;
+    }
 
     ForwardResult {
         backend_id,
@@ -101,13 +133,8 @@ pub async fn run_forwarding(
 /// What style of TCP cleanup the connection needs after the request resolves.
 #[derive(Debug, Clone, Copy)]
 enum CleanupKind {
-    /// Drain reads to EOF (or timeout). Use when the peer is expected to close.
     Drain,
-    /// Send our own Close (capped 50ms), then drain. Use on Cancel/ClientGone:
-    /// peer doesn't support cancel and will keep producing — be polite.
     ActiveClose,
-    /// Skip the drain entirely. Use for hung backends: server is sleeping
-    /// and will not FIN, so the drain would just sit idle for the timeout.
     Drop,
 }
 
@@ -121,7 +148,6 @@ fn cleanup_kind(outcome: &ForwardOutcome) -> CleanupKind {
 
 fn spawn_ws_cleanup(ws: BackendWs, drain_timeout: Duration, kind: CleanupKind) {
     if matches!(kind, CleanupKind::Drop) {
-        // Just drop the ws on this thread; no need for a task.
         drop(ws);
         return;
     }
@@ -148,9 +174,6 @@ async fn do_forward(
     mut cancel_rx: oneshot::Receiver<()>,
     metrics: &Arc<Metrics>,
 ) -> ForwardOutcome {
-    // Liveness check: if the warm slot already has buffered data (pre-start
-    // error from REFUSE chaos, server crashed during the gap, etc.), handle it
-    // before sending start.
     if let Some(early) = check_warm_slot_liveness(ws).await {
         return early;
     }
@@ -171,6 +194,12 @@ async fn do_forward(
     let request_start = Instant::now();
     let mut first_chunk_time: Option<Instant> = None;
 
+    // Single Sleep timer reused across iterations (#8 micro-fix). Each
+    // successful read resets the deadline; firing means hang_timeout elapsed
+    // without any progress.
+    let sleep = tokio::time::sleep(hang_timeout);
+    tokio::pin!(sleep);
+
     loop {
         tokio::select! {
             biased;
@@ -178,21 +207,24 @@ async fn do_forward(
                 tracing::debug!(stream = %stream_id, "stream cancelled");
                 return ForwardOutcome::Cancelled;
             }
-            read = tokio::time::timeout(hang_timeout, ws.next()) => {
+            _ = &mut sleep => {
+                tracing::warn!(stream = %stream_id, "hung — no data in {hang_timeout:?}");
+                return ForwardOutcome::BackendHung;
+            }
+            read = ws.next() => {
+                // Reset the hang deadline before processing the message so
+                // subsequent reads have the full hang_timeout window.
+                sleep.as_mut().reset(tokio::time::Instant::now() + hang_timeout);
                 match read {
-                    Err(_elapsed) => {
-                        tracing::warn!(stream = %stream_id, "hung — no data in {hang_timeout:?}");
-                        return ForwardOutcome::BackendHung;
-                    }
-                    Ok(None) => {
+                    None => {
                         tracing::warn!(stream = %stream_id, "connection closed without done");
                         return ForwardOutcome::BackendCrashed;
                     }
-                    Ok(Some(Err(e))) => {
+                    Some(Err(e)) => {
                         tracing::warn!(stream = %stream_id, "ws error: {e}");
                         return ForwardOutcome::BackendCrashed;
                     }
-                    Ok(Some(Ok(msg))) => match msg {
+                    Some(Ok(msg)) => match msg {
                         Message::Binary(data) => {
                             if first_chunk_time.is_none() {
                                 first_chunk_time = Some(Instant::now());
@@ -200,10 +232,6 @@ async fn do_forward(
 
                             let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
-                            // enqueue is non-blocking: it pushes into the
-                            // per-stream queue with drop-oldest semantics.
-                            // The only reason it can fail is if the client
-                            // disconnected.
                             if client_streams
                                 .enqueue(stream_id, ClientEvent::Binary(tagged))
                                 .is_err()
@@ -249,20 +277,13 @@ async fn do_forward(
     }
 }
 
-/// Non-blocking poll of the warm slot before sending start.
-/// Returns Some(outcome) if the connection is dead or has buffered data,
-/// None if Pending or only carries control frames (slot is alive — proceed
-/// with start).
 async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> {
     use futures_util::future::poll_immediate;
     match poll_immediate(ws.next()).await {
-        None => None, // Pending: alive
+        None => None,
         Some(None) => Some(ForwardOutcome::BackendCrashed),
         Some(Some(Err(_))) => Some(ForwardOutcome::BackendCrashed),
         Some(Some(Ok(Message::Close(_)))) => Some(ForwardOutcome::BackendCrashed),
-        // WebSocket control frames — the peer (or tokio-tungstenite's keepalive
-        // path) may surface Ping/Pong on an idle warm slot. They are not data
-        // and don't indicate a bad backend; treat as alive.
         Some(Some(Ok(Message::Ping(_)))) | Some(Some(Ok(Message::Pong(_)))) => None,
         Some(Some(Ok(Message::Text(t)))) => {
             let m = BackendMessage::from_text(&t);
