@@ -48,6 +48,12 @@ pub struct ForwardResult {
 ///
 /// `cancel_rx` lets the dispatcher abort an in-flight stream on client request.
 /// `drain_timeout` bounds the post-terminal read-to-EOF window.
+///
+/// On any terminal outcome, this function returns the `ForwardResult` to the
+/// caller *immediately* and spawns a detached task to handle TCP cleanup
+/// (drain to EOF + drop). The dispatcher learns about the completion without
+/// waiting for the cleanup tail — this removes ~drain_timeout (default 100ms)
+/// of "backend dark time" before reconnect can begin.
 pub async fn run_forwarding(
     backend_id: BackendId,
     mut ws: BackendWs,
@@ -66,16 +72,16 @@ pub async fn run_forwarding(
         request.speaker_id,
         &request.client_tx,
         hang_timeout,
-        drain_timeout,
         cancel_rx,
         &metrics,
     )
     .await;
 
-    // ws is dropped here — by this point either drain_close has consumed the
-    // peer's FIN (passive-close path) or the peer never sent FIN (active-close
-    // path: hang/cancel). Either way, the slot is consumed.
-    drop(ws);
+    // Decide on cleanup style based on outcome, then detach. The drain has
+    // no semantic role in the request flow — it's purely TCP hygiene
+    // (consume peer's FIN before sending our own = passive closer).
+    let cleanup = cleanup_kind(&outcome);
+    spawn_ws_cleanup(ws, drain_timeout, cleanup);
 
     ForwardResult {
         backend_id,
@@ -91,6 +97,45 @@ pub async fn run_forwarding(
     }
 }
 
+/// What style of TCP cleanup the connection needs after the request resolves.
+#[derive(Debug, Clone, Copy)]
+enum CleanupKind {
+    /// Drain reads to EOF (or timeout). Use when the peer is expected to close.
+    Drain,
+    /// Send our own Close (capped 50ms), then drain. Use on Cancel/ClientGone:
+    /// peer doesn't support cancel and will keep producing — be polite.
+    ActiveClose,
+    /// Skip the drain entirely. Use for hung backends: server is sleeping
+    /// and will not FIN, so the drain would just sit idle for the timeout.
+    Drop,
+}
+
+fn cleanup_kind(outcome: &ForwardOutcome) -> CleanupKind {
+    match outcome {
+        ForwardOutcome::BackendHung => CleanupKind::Drop,
+        ForwardOutcome::Cancelled | ForwardOutcome::ClientGone => CleanupKind::ActiveClose,
+        _ => CleanupKind::Drain,
+    }
+}
+
+fn spawn_ws_cleanup(ws: BackendWs, drain_timeout: Duration, kind: CleanupKind) {
+    if matches!(kind, CleanupKind::Drop) {
+        // Just drop the ws on this thread; no need for a task.
+        drop(ws);
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ws = ws;
+        if matches!(kind, CleanupKind::ActiveClose) {
+            let _ = tokio::time::timeout(Duration::from_millis(50), ws.close(None)).await;
+        }
+        let _ = tokio::time::timeout(drain_timeout, async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_forward(
     ws: &mut BackendWs,
@@ -99,7 +144,6 @@ async fn do_forward(
     speaker_id: u32,
     client_tx: &mpsc::Sender<ClientEvent>,
     hang_timeout: Duration,
-    drain_timeout: Duration,
     mut cancel_rx: oneshot::Receiver<()>,
     metrics: &Arc<Metrics>,
 ) -> ForwardOutcome {
@@ -107,7 +151,6 @@ async fn do_forward(
     // error from REFUSE chaos, server crashed during the gap, etc.), handle it
     // before sending start.
     if let Some(early) = check_warm_slot_liveness(ws).await {
-        drain_close(ws, drain_timeout).await;
         return early;
     }
 
@@ -121,7 +164,6 @@ async fn do_forward(
         .await
     {
         tracing::warn!(stream = %stream_id, "send start failed: {e}");
-        drain_close(ws, drain_timeout).await;
         return ForwardOutcome::BackendCrashed;
     }
 
@@ -133,27 +175,20 @@ async fn do_forward(
             biased;
             _ = &mut cancel_rx => {
                 tracing::debug!(stream = %stream_id, "stream cancelled");
-                // Best-effort: try to send WS Close, then short drain. Backend
-                // doesn't support cancel, so we'll likely end as active closer.
-                active_close(ws, drain_timeout).await;
                 return ForwardOutcome::Cancelled;
             }
             read = tokio::time::timeout(hang_timeout, ws.next()) => {
                 match read {
                     Err(_elapsed) => {
                         tracing::warn!(stream = %stream_id, "hung — no data in {hang_timeout:?}");
-                        // No drain — server is sleeping and won't FIN.
                         return ForwardOutcome::BackendHung;
                     }
                     Ok(None) => {
                         tracing::warn!(stream = %stream_id, "connection closed without done");
-                        // Peer already closed; drain is a no-op but cheap.
-                        drain_close(ws, drain_timeout).await;
                         return ForwardOutcome::BackendCrashed;
                     }
                     Ok(Some(Err(e))) => {
                         tracing::warn!(stream = %stream_id, "ws error: {e}");
-                        drain_close(ws, drain_timeout).await;
                         return ForwardOutcome::BackendCrashed;
                     }
                     Ok(Some(Ok(msg))) => match msg {
@@ -167,15 +202,10 @@ async fn do_forward(
                             tokio::select! {
                                 biased;
                                 _ = &mut cancel_rx => {
-                                    active_close(ws, drain_timeout).await;
                                     return ForwardOutcome::Cancelled;
                                 }
                                 send = client_tx.send(ClientEvent::Binary(tagged)) => {
                                     if send.is_err() {
-                                        // Client gone: backend keeps producing. Drain briefly
-                                        // and drop. Active-close cost on this path is acceptable
-                                        // (rare).
-                                        active_close(ws, drain_timeout).await;
                                         return ForwardOutcome::ClientGone;
                                     }
                                 }
@@ -192,27 +222,23 @@ async fn do_forward(
                                     let ttfc = first_chunk_time
                                         .map(|t| t.duration_since(request_start))
                                         .unwrap_or_default();
-                                    drain_close(ws, drain_timeout).await;
                                     return ForwardOutcome::Success {
                                         ttfc,
                                         audio_duration,
                                     };
                                 }
                                 BackendMessage::Error { message } => {
-                                    drain_close(ws, drain_timeout).await;
                                     if message.to_lowercase().contains("busy") {
                                         return ForwardOutcome::BackendBusy;
                                     }
                                     return ForwardOutcome::BackendError(message);
                                 }
                                 BackendMessage::Unknown(raw) => {
-                                    drain_close(ws, drain_timeout).await;
                                     return ForwardOutcome::MalformedResponse(raw);
                                 }
                             }
                         }
                         Message::Close(_) => {
-                            drain_close(ws, drain_timeout).await;
                             return ForwardOutcome::BackendCrashed;
                         }
                         _ => {}
@@ -260,21 +286,4 @@ async fn check_warm_slot_liveness(ws: &mut BackendWs) -> Option<ForwardOutcome> 
             "pre-start binary".to_string(),
         )),
     }
-}
-
-/// Best-effort active close: send WS Close frame (capped at 50ms), then drain.
-/// Used on Cancel/ClientGone paths where we want to be polite even though the
-/// server doesn't support cancellation and will likely keep producing frames.
-async fn active_close(ws: &mut BackendWs, drain_timeout: Duration) {
-    let _ = tokio::time::timeout(Duration::from_millis(50), ws.close(None)).await;
-    drain_close(ws, drain_timeout).await;
-}
-
-/// Drain reads to EOF (or timeout) so the peer's FIN arrives before our drop
-/// sends ours — making us the passive TCP closer.
-async fn drain_close(ws: &mut BackendWs, deadline: Duration) {
-    let _ = tokio::time::timeout(deadline, async {
-        while ws.next().await.is_some() {}
-    })
-    .await;
 }
