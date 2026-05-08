@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# Perf harness outputs
+perf/runs/*
+!perf/runs/.gitkeep
