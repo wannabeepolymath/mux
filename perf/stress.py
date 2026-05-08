@@ -6,10 +6,13 @@ This file is the CLI entrypoint; pure histogram math lives in `metrics_diff.py`.
 from __future__ import annotations
 
 import csv
+import random
 import signal
+import sys
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 class CsvRowWriter:
@@ -69,3 +72,108 @@ class CsvRowWriter:
                 self._f.flush()
             finally:
                 self._f.close()
+
+
+# Path injection: assignment/ has no __init__.py and is treated as read-only
+# per the spec. Inject it onto sys.path so we can import test_client cleanly.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ASSIGN_DIR = _REPO_ROOT / "assignment"
+if str(_ASSIGN_DIR) not in sys.path:
+    sys.path.insert(0, str(_ASSIGN_DIR))
+
+# Imported lazily inside run_request to keep import cheap and to make unit
+# tests of build_csv_row independent of the assignment package.
+
+
+def poisson_arrival_delays(
+    rps: float, count: int, seed: int | None = None
+) -> Iterator[float]:
+    """Yield exponential inter-arrival times (mean = 1/rps) for `count` arrivals.
+
+    This is the spec-mandated Poisson process. Constant-spacing schedulers are
+    explicitly forbidden because they under-stress queueing and produce
+    optimistic latency tails. See spec §3.3.
+    """
+    rng = random.Random(seed)
+    for _ in range(count):
+        yield rng.expovariate(rps)
+
+
+def _classify_error(error_msg: str, chunks_received: int) -> str:
+    """Map a `RequestResult.error` string to a CSV `error_kind` token.
+
+    See spec §5. Connection-level errors → `connect_failed` or
+    `unexpected_close`; server-side error frames → `server_error`. Unknown
+    errors fall through to `server_error` rather than introducing a new token.
+    """
+    if "connection" in error_msg.lower() or "websocket" in error_msg.lower():
+        # Distinguish "got some chunks then dropped" from "never connected".
+        if chunks_received > 0:
+            return "unexpected_close"
+        return "connect_failed"
+    return "server_error"
+
+
+def build_csv_row(req_id: int, ts_unix_ms: int, result) -> dict:
+    """Build a CSV row dict from a test_client.RequestResult."""
+    if result.success:
+        return {
+            "ts_unix_ms": ts_unix_ms,
+            "req_id": req_id,
+            "status": "success",
+            "error_kind": "",
+            "ttfc_ms": result.ttfc_ms,
+            "duration_ms": result.total_ms,
+            "bytes_received": result.total_bytes,
+            "chunk_count": result.chunks_received,
+        }
+
+    if result.error == "timeout":
+        return {
+            "ts_unix_ms": ts_unix_ms,
+            "req_id": req_id,
+            "status": "timeout",
+            "error_kind": "",
+            "ttfc_ms": result.ttfc_ms if result.ttfc_ms else "",
+            "duration_ms": result.total_ms if result.total_ms else "",
+            "bytes_received": result.total_bytes,
+            "chunk_count": result.chunks_received,
+        }
+
+    return {
+        "ts_unix_ms": ts_unix_ms,
+        "req_id": req_id,
+        "status": "error",
+        "error_kind": _classify_error(result.error, result.chunks_received),
+        "ttfc_ms": result.ttfc_ms if result.ttfc_ms else "",
+        "duration_ms": result.total_ms if result.total_ms else "",
+        "bytes_received": result.total_bytes,
+        "chunk_count": result.chunks_received,
+    }
+
+
+def build_dropped_row(req_id: int, ts_unix_ms: int) -> dict:
+    """Build a row for an arrival that hit the --max-inflight cap and was dropped."""
+    return {
+        "ts_unix_ms": ts_unix_ms,
+        "req_id": req_id,
+        "status": "dropped_offered",
+        "error_kind": "",
+        "ttfc_ms": "",
+        "duration_ms": "",
+        "bytes_received": 0,
+        "chunk_count": 0,
+    }
+
+
+async def run_request(url: str, req_id: int, csv_writer: CsvRowWriter,
+                      timeout: float = 30.0) -> None:
+    """Issue one WS request via send_single_request and write a CSV row."""
+    from test_client import send_single_request  # noqa: E402  (lazy import)
+
+    ts = int(time.time() * 1000)
+    result = await send_single_request(
+        url, text=f"perf stress req {req_id}", stream_id=f"perf-{req_id}",
+        timeout=timeout,
+    )
+    csv_writer.write_row(build_csv_row(req_id, ts, result))

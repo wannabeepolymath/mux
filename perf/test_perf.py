@@ -193,3 +193,94 @@ def test_csv_writer_is_line_buffered(tmp_path):
     assert text.count("\n") >= 2
     assert "success" in text
     w.close()
+
+
+import asyncio
+import statistics
+from unittest.mock import patch
+
+from perf.stress import build_csv_row, poisson_arrival_delays
+
+
+def test_poisson_arrival_delays_long_run_mean_close_to_target():
+    """With many samples, the mean inter-arrival time should be ~1/rps."""
+    rps = 50
+    n = 5000
+    delays = list(poisson_arrival_delays(rps=rps, count=n, seed=42))
+    assert len(delays) == n
+    expected_mean = 1.0 / rps
+    actual_mean = statistics.mean(delays)
+    # Exponential SD = mean; with n=5000, SE ≈ mean/sqrt(n) ≈ 0.014 * mean.
+    # Allow ±15% tolerance to keep CI flake-free.
+    assert 0.85 * expected_mean < actual_mean < 1.15 * expected_mean
+
+
+def test_poisson_arrival_delays_are_not_constant():
+    """Guard against accidental fixed-interval implementation."""
+    delays = list(poisson_arrival_delays(rps=10, count=50, seed=7))
+    assert statistics.stdev(delays) > 0.01  # exponential SD = mean = 0.1
+
+
+# ---- build_csv_row ----
+
+class _FakeResult:
+    def __init__(self, success=False, error="", ttfc_ms=0.0, total_ms=0.0,
+                 total_bytes=0, chunks_received=0):
+        self.success = success
+        self.error = error
+        self.ttfc_ms = ttfc_ms
+        self.total_ms = total_ms
+        self.total_bytes = total_bytes
+        self.chunks_received = chunks_received
+
+
+def test_build_csv_row_success():
+    r = _FakeResult(success=True, ttfc_ms=12.3, total_ms=200.0,
+                    total_bytes=4096, chunks_received=32)
+    row = build_csv_row(req_id=7, ts_unix_ms=1000, result=r)
+    assert row["req_id"] == 7
+    assert row["status"] == "success"
+    assert row["error_kind"] == ""
+    assert row["ttfc_ms"] == 12.3
+    assert row["duration_ms"] == 200.0
+    assert row["bytes_received"] == 4096
+    assert row["chunk_count"] == 32
+
+
+def test_build_csv_row_timeout():
+    r = _FakeResult(success=False, error="timeout", total_ms=30000.0)
+    row = build_csv_row(req_id=1, ts_unix_ms=2000, result=r)
+    assert row["status"] == "timeout"
+    assert row["error_kind"] == ""
+
+
+def test_build_csv_row_connect_failure():
+    r = _FakeResult(success=False, error="connection timeout")
+    row = build_csv_row(req_id=2, ts_unix_ms=3000, result=r)
+    assert row["status"] == "error"
+    assert row["error_kind"] == "connect_failed"
+
+
+def test_build_csv_row_unexpected_close():
+    r = _FakeResult(success=False, error="connection closed: 1006",
+                    chunks_received=2, ttfc_ms=15.0, total_ms=200.0)
+    row = build_csv_row(req_id=3, ts_unix_ms=4000, result=r)
+    assert row["status"] == "error"
+    assert row["error_kind"] == "unexpected_close"
+
+
+def test_build_csv_row_server_error():
+    r = _FakeResult(success=False, error="backend rejected request")
+    row = build_csv_row(req_id=4, ts_unix_ms=5000, result=r)
+    assert row["status"] == "error"
+    assert row["error_kind"] == "server_error"
+
+
+def test_build_csv_row_dropped():
+    """A dropped_offered row is built without a RequestResult."""
+    from perf.stress import build_dropped_row
+    row = build_dropped_row(req_id=99, ts_unix_ms=6000)
+    assert row["status"] == "dropped_offered"
+    assert row["ttfc_ms"] == ""
+    assert row["duration_ms"] == ""
+    assert row["bytes_received"] == 0
