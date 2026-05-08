@@ -144,3 +144,37 @@ def diff_histograms(start: Histogram, end: Histogram) -> Histogram:
         count=end.count - start.count,
         sum=end.sum - start.sum,
     )
+
+
+def quantile_from_buckets(hist: Histogram, q: float) -> float | None:
+    """Approximate quantile q ∈ [0, 1] from a Prometheus-style cumulative histogram.
+
+    Uses linear interpolation within the bucket containing the target rank, matching
+    Prometheus's `histogram_quantile()` convention. Returns None for an empty
+    histogram (count == 0). When the target falls in the +Inf bucket, returns the
+    previous (finite) boundary — we cannot extrapolate past +Inf, so this is the
+    best we can do.
+
+    The lower edge of the lowest finite bucket is treated as 0.
+    """
+    if hist.count == 0:
+        return None
+    if not 0.0 <= q <= 1.0:
+        raise ValueError(f"q must be in [0, 1], got {q}")
+
+    target = q * hist.count
+    prev_le = 0.0
+    prev_cumulative = 0
+    for le, cumulative in hist.buckets:
+        if cumulative >= target:
+            if math.isinf(le):
+                return prev_le
+            bucket_count = cumulative - prev_cumulative
+            if bucket_count == 0:
+                return prev_le
+            frac = (target - prev_cumulative) / bucket_count
+            return prev_le + frac * (le - prev_le)
+        prev_le = le
+        prev_cumulative = cumulative
+
+    return prev_le

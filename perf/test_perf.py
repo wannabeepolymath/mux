@@ -108,3 +108,46 @@ def test_diff_histograms_bucket_boundary_mismatch():
     end = _h([(0.05, 5), (math.inf, 10)], count=10, total_sum=0.5)
     with pytest.raises(ValueError, match="bucket boundaries"):
         diff_histograms(start, end)
+
+
+from perf.metrics_diff import quantile_from_buckets
+
+
+def test_quantile_basic_interpolation():
+    # 100 samples: 0 in [0, 0.01], 50 in [0.01, 0.05], 50 in [0.05, 0.1], 0 above.
+    hist = _h([(0.01, 0), (0.05, 50), (0.1, 100), (math.inf, 100)], count=100, total_sum=5.5)
+    # p50 → target = 50, falls right at the 0.05 boundary
+    assert quantile_from_buckets(hist, 0.5) == pytest.approx(0.05)
+    # p25 → target = 25, halfway through the (0.01, 0.05] bucket
+    assert quantile_from_buckets(hist, 0.25) == pytest.approx(0.03)
+    # p75 → target = 75, halfway through the (0.05, 0.1] bucket
+    assert quantile_from_buckets(hist, 0.75) == pytest.approx(0.075)
+
+
+def test_quantile_falls_in_inf_bucket():
+    # 100 samples, but 5 are in the +Inf bucket (i.e., > 0.1)
+    hist = _h([(0.01, 50), (0.1, 95), (math.inf, 100)], count=100, total_sum=10.0)
+    # p99 → target = 99, falls in (0.1, +Inf) — return previous boundary (0.1) since
+    # we cannot interpolate past +Inf
+    assert quantile_from_buckets(hist, 0.99) == pytest.approx(0.1)
+
+
+def test_quantile_empty_histogram_returns_none():
+    hist = _h([(0.01, 0), (math.inf, 0)], count=0, total_sum=0.0)
+    assert quantile_from_buckets(hist, 0.5) is None
+
+
+def test_quantile_at_zero_lower_boundary():
+    # All 10 samples in [0, 0.01]
+    hist = _h([(0.01, 10), (math.inf, 10)], count=10, total_sum=0.05)
+    # p50 → target = 5, halfway through (0, 0.01]
+    assert quantile_from_buckets(hist, 0.5) == pytest.approx(0.005)
+
+
+def test_quantile_p99_with_50_samples_documents_noise():
+    # Documents the chart-design rationale: at low sample counts, p99 is
+    # essentially the upper boundary of the highest bucket containing samples.
+    # 50 samples, all in [0, 0.5]
+    hist = _h([(0.5, 50), (math.inf, 50)], count=50, total_sum=5.0)
+    # p99 → target = 49.5, very near the top of the (0, 0.5] bucket
+    assert 0.49 < quantile_from_buckets(hist, 0.99) <= 0.5
