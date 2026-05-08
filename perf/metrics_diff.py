@@ -86,6 +86,8 @@ def parse_histogram(metrics_text: str, metric_name: str) -> Histogram:
     if not bucket_totals:
         raise KeyError(f"histogram {metric_name!r} not found in metrics text")
 
+    # In rare cases _count line is missing; fall back to +Inf bucket
+    # (always equals total count in Prometheus histograms).
     if total_count is None:
         total_count = bucket_totals.get(math.inf, max(bucket_totals.values()))
     if total_sum is None:
