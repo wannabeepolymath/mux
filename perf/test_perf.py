@@ -311,26 +311,47 @@ def _wait_for_port(host: str, port: int, timeout_s: float = 5.0) -> bool:
     return False
 
 
-def _find_python_with_websockets(repo_root: Path) -> str:
-    """Return a Python interpreter that has `websockets` installed.
+def _find_python_with_deps(repo_root: Path, *modules: str) -> str:
+    """Return a Python interpreter that has all requested modules installed.
 
     Preference order:
-      1. sys.executable (the interpreter running pytest) if websockets is available.
-      2. <repo_root>/.venv/bin/python if it exists and has websockets.
-      3. Fall back to sys.executable (subprocess will fail, skip will catch it).
+      1. sys.executable (the interpreter running pytest) if all modules are available.
+      2. <repo_root>/.venv313/bin/python if it exists and has all modules.
+      3. <repo_root>/.venv/bin/python if it exists and has all modules.
+      4. Fall back to sys.executable (subprocess will fail, skip will catch it).
+
+    Parameters
+    ----------
+    repo_root:
+        Root of the repository.
+    *modules:
+        Module names that must be importable (e.g. ``"websockets"``,
+        ``"matplotlib"``, ``"numpy"``).
     """
     import importlib.util
-    if importlib.util.find_spec("websockets") is not None:
-        return sys.executable
-    venv_py = repo_root / ".venv" / "bin" / "python"
-    if venv_py.exists():
+
+    def _has_all(py: str) -> bool:
+        check = "; ".join(f"import {m}" for m in modules)
         ret = subprocess.call(
-            [str(venv_py), "-c", "import websockets"],
+            [py, "-c", check],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        if ret == 0:
+        return ret == 0
+
+    if all(importlib.util.find_spec(m) is not None for m in modules):
+        return sys.executable
+
+    for venv_name in (".venv313", ".venv"):
+        venv_py = repo_root / venv_name / "bin" / "python"
+        if venv_py.exists() and _has_all(str(venv_py)):
             return str(venv_py)
+
     return sys.executable
+
+
+# Back-compat alias used by mock_backend fixture below.
+def _find_python_with_websockets(repo_root: Path) -> str:
+    return _find_python_with_deps(repo_root, "websockets")
 
 
 @pytest.fixture
@@ -418,3 +439,43 @@ def test_stress_smoke_5s_at_10rps(mock_backend, tmp_path):
     assert summary["quantiles_ms"]["sut"]["source"] == "skipped"
     assert summary["quantiles_ms"]["sut"]["reason"] == "metrics_unreachable"
     assert summary["quantiles_ms"]["delta"] is None
+
+
+# ---------------------------------------------------------------------------
+# plot_latency.py smoke test
+# ---------------------------------------------------------------------------
+
+
+def test_plot_latency_smoke(tmp_path):
+    """Synthetic 60-row CSV → 4 non-empty PNGs in out_dir."""
+    csv_path = tmp_path / "synthetic.csv"
+    out_dir = tmp_path / "charts"
+
+    # Build a synthetic CSV: 60 success rows over 6 simulated seconds at ~10 rps.
+    header = "ts_unix_ms,req_id,status,error_kind,ttfc_ms,duration_ms,bytes_received,chunk_count\n"
+    rows = []
+    base = 1_700_000_000_000
+    for i in range(60):
+        ts = base + i * 100  # 100 ms apart → 10 rps
+        ttfc = 50 + (i % 10) * 5  # 50..95 ms
+        rows.append(f"{ts},{i},success,,{ttfc:.1f},{ttfc + 100:.1f},4096,32\n")
+    csv_path.write_text(header + "".join(rows))
+
+    repo_root = Path(__file__).resolve().parent.parent
+    py = _find_python_with_deps(repo_root, "matplotlib", "numpy")
+    rc = subprocess.call([
+        py, "-m", "perf.plot_latency",
+        str(csv_path), "--out-dir", str(out_dir),
+    ], cwd=str(repo_root))
+    assert rc == 0
+
+    expected = [
+        "latency_over_time.png",
+        "latency_cdf.png",
+        "throughput.png",
+        "success_rate.png",
+    ]
+    for name in expected:
+        p = out_dir / name
+        assert p.exists(), f"{name} was not produced"
+        assert p.stat().st_size > 1000, f"{name} is suspiciously small"
