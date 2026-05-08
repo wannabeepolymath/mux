@@ -292,7 +292,6 @@ def test_build_csv_row_dropped():
 # ---------------------------------------------------------------------------
 
 import json
-import shutil
 import socket
 import subprocess
 import sys
@@ -359,7 +358,11 @@ def mock_backend(tmp_path):
     )
     if not _wait_for_port("127.0.0.1", 9200, timeout_s=5.0):
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
         pytest.skip("mock_backend did not bind 127.0.0.1:9200 in time")
 
     yield "ws://127.0.0.1:9200/v1/ws/speech"
