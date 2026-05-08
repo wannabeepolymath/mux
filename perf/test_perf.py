@@ -284,3 +284,134 @@ def test_build_csv_row_dropped():
     assert row["ttfc_ms"] == ""
     assert row["duration_ms"] == ""
     assert row["bytes_received"] == 0
+    assert row["chunk_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Integration smoke test: stress.py end-to-end against mock_backend
+# ---------------------------------------------------------------------------
+
+import json
+import shutil
+import socket
+import subprocess
+import sys
+import time as _time
+from pathlib import Path
+
+
+def _wait_for_port(host: str, port: int, timeout_s: float = 5.0) -> bool:
+    """Poll until a TCP connect to (host, port) succeeds or timeout elapses."""
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            _time.sleep(0.1)
+    return False
+
+
+def _find_python_with_websockets(repo_root: Path) -> str:
+    """Return a Python interpreter that has `websockets` installed.
+
+    Preference order:
+      1. sys.executable (the interpreter running pytest) if websockets is available.
+      2. <repo_root>/.venv/bin/python if it exists and has websockets.
+      3. Fall back to sys.executable (subprocess will fail, skip will catch it).
+    """
+    import importlib.util
+    if importlib.util.find_spec("websockets") is not None:
+        return sys.executable
+    venv_py = repo_root / ".venv" / "bin" / "python"
+    if venv_py.exists():
+        ret = subprocess.call(
+            [str(venv_py), "-c", "import websockets"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ret == 0:
+            return str(venv_py)
+    return sys.executable
+
+
+@pytest.fixture
+def mock_backend(tmp_path):
+    """Start assignment/mock_backend.py with one calm worker on port 9200, tear down after."""
+    repo_root = Path(__file__).resolve().parent.parent
+    mb = repo_root / "assignment" / "mock_backend.py"
+    if not mb.exists():
+        pytest.skip("assignment/mock_backend.py not present")
+
+    py = _find_python_with_websockets(repo_root)
+    proc = subprocess.Popen(
+        [
+            py, str(mb),
+            "--workers", "1", "--base-port", "9200", "--calm",
+            # Fast response so a single worker can sustain 10 RPS:
+            # 0.1 ms delays make service time ~5 ms (dominated by asyncio/TCP
+            # round-trip overhead), leaving sufficient headroom for Poisson bursts.
+            "--first-chunk-delay", "0.0001",
+            "--chunk-interval", "0.0001",
+            "--no-jitter",
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=str(repo_root),
+    )
+    if not _wait_for_port("127.0.0.1", 9200, timeout_s=5.0):
+        proc.terminate()
+        proc.wait(timeout=5)
+        pytest.skip("mock_backend did not bind 127.0.0.1:9200 in time")
+
+    yield "ws://127.0.0.1:9200/v1/ws/speech"
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def test_stress_smoke_5s_at_10rps(mock_backend, tmp_path):
+    """End-to-end: stress.py for 5s at 10rps against a calm mock backend.
+
+    Asserts:
+      - CSV row count is in [30, 70] (Poisson-loose; spec §6)
+      - success rate > 95%
+      - <name>.summary.json exists with required structure
+      - SUT cross-check is `skipped` (mock_backend has no /metrics) — this
+        verifies the skip path rather than the histogram_diff path
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    out_csv = tmp_path / "smoke.csv"
+    summary_path = out_csv.with_suffix(".summary.json")
+
+    py = _find_python_with_websockets(repo_root)
+    rc = subprocess.call([
+        py, "-m", "perf.stress",
+        "--url", mock_backend,
+        "--rps", "10",
+        "--duration", "5",
+        "--out", str(out_csv),
+    ], cwd=str(repo_root))
+    assert rc == 0, "stress.py exited non-zero"
+
+    # CSV row count
+    lines = out_csv.read_text().splitlines()
+    data_rows = lines[1:]  # skip header
+    assert 30 <= len(data_rows) <= 70, f"got {len(data_rows)} rows (expected 30..70 for 5s@10rps Poisson)"
+
+    # Success rate
+    successes = sum(1 for line in data_rows if ",success," in line)
+    assert successes / max(1, len(data_rows)) > 0.95, "success rate ≤ 95%"
+
+    # Summary JSON
+    assert summary_path.exists(), "summary.json was not written"
+    summary = json.loads(summary_path.read_text())
+    assert summary["run"]["mode"] == "open_loop"
+    assert summary["run"]["target_rps"] == 10
+    assert summary["counts"]["success"] == successes
+    assert summary["quantiles_ms"]["csv"]["p50"] is not None
+    assert summary["quantiles_ms"]["sut"]["source"] == "skipped"
+    assert summary["quantiles_ms"]["sut"]["reason"] == "metrics_unreachable"
+    assert summary["quantiles_ms"]["delta"] is None

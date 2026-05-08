@@ -191,6 +191,11 @@ async def run_request(url: str, req_id: int, csv_writer: CsvRowWriter,
     result = await send_single_request(
         url, text=f"perf stress req {req_id}", stream_id=f"perf-{req_id}",
         timeout=timeout,
+        # The stress tool measures throughput/latency only — it does not validate
+        # per-stream binary framing (a correctness concern).  Passing False here
+        # lets stress.py target both the multiplexer and a raw mock_backend
+        # without stream-ID-prefix parsing errors.
+        expect_stream_tags=False,
     )
     csv_writer.write_row(build_csv_row(req_id, ts, result))
 
