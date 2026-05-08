@@ -151,3 +151,45 @@ def test_quantile_p99_with_50_samples_documents_noise():
     hist = _h([(0.5, 50), (math.inf, 50)], count=50, total_sum=5.0)
     # p99 → target = 49.5, very near the top of the (0, 0.5] bucket
     assert 0.49 < quantile_from_buckets(hist, 0.99) <= 0.5
+
+
+import csv as _csv
+
+from perf.stress import CsvRowWriter
+
+
+def test_csv_writer_writes_header_and_rows(tmp_path):
+    out = tmp_path / "rows.csv"
+    w = CsvRowWriter(out)
+    w.write_row({
+        "ts_unix_ms": 1000, "req_id": 0, "status": "success", "error_kind": "",
+        "ttfc_ms": 12.3, "duration_ms": 100.4, "bytes_received": 4096, "chunk_count": 32,
+    })
+    w.write_row({
+        "ts_unix_ms": 1100, "req_id": 1, "status": "error", "error_kind": "connect_failed",
+        "ttfc_ms": "", "duration_ms": 5.0, "bytes_received": 0, "chunk_count": 0,
+    })
+    w.close()
+
+    with out.open() as f:
+        reader = _csv.DictReader(f)
+        rows = list(reader)
+    assert reader.fieldnames == list(CsvRowWriter.HEADER)
+    assert len(rows) == 2
+    assert rows[0]["status"] == "success"
+    assert rows[1]["error_kind"] == "connect_failed"
+
+
+def test_csv_writer_is_line_buffered(tmp_path):
+    """After write_row returns, the row is durable on disk without an explicit flush."""
+    out = tmp_path / "rows.csv"
+    w = CsvRowWriter(out)
+    w.write_row({
+        "ts_unix_ms": 1, "req_id": 0, "status": "success", "error_kind": "",
+        "ttfc_ms": 1.0, "duration_ms": 2.0, "bytes_received": 1, "chunk_count": 1,
+    })
+    # Read back immediately (without close()) — should see header + row.
+    text = out.read_text()
+    assert text.count("\n") >= 2
+    assert "success" in text
+    w.close()
