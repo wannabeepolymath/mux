@@ -70,13 +70,15 @@ The CSV is the only contract between stress and plot. Anything that can produce 
 
 **Open-loop is the default.** Arrivals follow a Poisson process at the target RPS, so the offered rate is independent of how fast the system responds. Each new request is dispatched on its own task; if the system can't keep up, in-flight count grows and we see queuing latency for what it is.
 
+**Poisson means exponential inter-arrivals.** Implementations MUST sample inter-arrival times as `random.expovariate(target_rps)` (exponential distribution, mean = 1/rps). Constant 1/rps spacing is a different (and worse-behaving) traffic shape — it under-stresses queueing and produces optimistic latency tails — and is explicitly forbidden. This is called out because "ticker at rps" reads natural in pseudocode and a future contributor could accidentally implement it.
+
 **Closed-loop is the fallback** for saturation/soak tests where we want to *know* we're applying constant pressure rather than constant arrival rate. Selected by passing `--concurrency` instead of `--rps`.
 
 **Shape:**
 
 ```
                     ┌──────────────────┐
-  ticker(rps) ──────►│  arrival queue  │
+  poisson_arrivals ─►│  arrival queue  │
                     └────────┬─────────┘
                              │  spawn task per arrival
                              ▼
@@ -95,7 +97,15 @@ Backpressure: a `--max-inflight` cap (default 500) drops new arrivals if exceede
 
 1. **`uvloop` by default.** Try-import `uvloop`; install as the asyncio policy if available, else fall back to the stdlib loop. On macOS and Linux this gives ~2–3× throughput headroom on socket-heavy workloads with no API change. (Phase 2's Rust load gen sidesteps Python's per-task overhead entirely.)
 
-2. **SUT-vs-CSV quantile cross-check.** At end of every run, scrape the multiplexer's `/metrics` endpoint, parse `mux_ttfc_seconds` histogram, compute server-side p50/p95/p99, and print alongside the same quantiles computed from the CSV. The delta is almost entirely load-gen + loopback + framing overhead — i.e., the contamination we're worried about. Save both sets of quantiles plus the per-quantile delta to `<name>.summary.json` next to the CSV. New CLI flag `--metrics-url` defaults to `http://<host_from_url>:9001/metrics`; if the scrape fails the run still completes and the cross-check is reported as skipped (with a warning).
+2. **SUT-vs-CSV quantile cross-check.** Computes server-side p50/p95/p99 from the multiplexer's `mux_ttfc_seconds` histogram and prints them alongside the same quantiles computed from the CSV. Saves both sets of quantiles, the per-quantile delta, and the run accounting fields (§3.4.1) to `<name>.summary.json` next to the CSV. New CLI flag `--metrics-url` defaults to `http://<host_from_url>:9001/metrics`; if the scrape fails the run still completes and the cross-check is reported as skipped (with a warning).
+
+   *Per-run isolation via bucket diff (mandatory).* Prometheus histograms are **cumulative from process start** — naively reading `/metrics` at end-of-run mixes the current run with every prior run, polluting SUT-side quantiles with stale data and silently invalidating the cross-check. To get this-run-only quantiles, `stress.py` MUST snapshot the histogram (per-bucket cumulative counts, plus `_count` and `_sum`) at run start and again at run end, diff the two, and compute quantiles from the diffed buckets via the same linear-interpolation formula Prometheus uses internally. The alternative — restarting the multiplexer before every run — is rejected: it disrupts in-flight samply traces, throws away warmed connection-pool state we want to measure, and is incompatible with the long-running profile sessions in §3.6.
+
+   *Counter reset/restart handling (mandatory).* If any end snapshot value is lower than its corresponding start snapshot value (any bucket, `_count`, or `_sum`), treat the run as having a metrics counter reset (typically mux restart) and mark SUT quantiles as skipped for that run (`source: "skipped"`, `reason: "counter_reset_or_restart"`). The run still completes and CSV-derived quantiles are still reported; only the SUT-vs-CSV delta is omitted for that run.
+
+   *What the SUT-side quantile is — and isn't.* SUT-side values are **estimated from histogram buckets, not exact samples**; precision is bounded by bucket boundaries. Default Prometheus buckets put a few milliseconds of quantization noise into the lower-millisecond range. The CSV-side quantile is exact (computed from raw samples), so a small delta is expected even with a zero-overhead load gen.
+
+   *What the delta is composed of.* The CSV-vs-SUT delta is the sum of (in roughly decreasing order at typical rates): kernel TCP / loopback driver overhead, WebSocket frame parse/serialise on both sides, asyncio task scheduling and GIL contention, and SUT-side bucket-quantisation noise. "Python overhead" is one term in that sum, not the whole thing — do not attribute the entire delta to load-gen contamination. The Phase 2 trigger in §7 is interpreted accordingly: it fires on delta growth with offered load (Python is the load-elastic term), not on absolute delta.
 
 3. **Self-CPU report.** Sample `os.times()` and `time.monotonic()` at start/end. At end of run, print `(utime + stime) / wall_time` as a fraction of one core, both for the load-gen process and (best-effort, via `psutil` if available, else skipped) for the SUT process. Emit a stderr `WARNING: load-gen CPU >25% of one core, measurements may be biased` when the load-gen value exceeds the threshold. Backup signal in case `/metrics` scraping is unavailable.
 
@@ -136,6 +146,54 @@ One row per attempted request. Fields:
 **Time-source rule.** `ts_unix_ms` uses wall-clock so rows can be aligned to external events (e.g., a backend kill recorded in another log). Both latency fields use `time.monotonic()` deltas captured at the same call site as the request issue, so NTP slews and DST transitions cannot poison the math.
 
 Why these fields: TTFC is the user-visible latency we care most about; `duration_ms` lets us cross-check overall throughput; `status`/`error_kind` lets the chart split success vs error lines without re-running.
+
+### 3.4.1 Summary JSON schema
+
+`<name>.summary.json` is written next to the CSV at end-of-run. It captures everything the CSV doesn't (run-level accounting and the SUT cross-check). Schema:
+
+```json
+{
+  "run": {
+    "start_unix_ms": 1714972800000,
+    "end_unix_ms":   1714972860000,
+    "duration_s":    60,
+    "ramp_up_s":     10,
+    "mode":          "open_loop",          // or "closed_loop"
+    "target_rps":    50,                   // number when mode=open_loop, else null
+    "concurrency":   null,                 // number when mode=closed_loop, else null
+    "url":           "ws://...",
+    "metrics_url":   "http://...:9001/metrics"
+  },
+  "counts": {
+    "attempted":              3000,
+    "success":                2987,
+    "error":                  3,
+    "timeout":                0,
+    "dropped_offered":        10,
+    "peak_inflight":          412,         // high-water mark of concurrent requests
+    "max_inflight_reached_count": 10       // arrivals that hit the cap (== dropped_offered)
+  },
+  "load_gen": {
+    "cpu_user_s":              7.42,
+    "cpu_system_s":            1.18,
+    "wall_s":                  60.0,
+    "cpu_fraction_one_core":   0.143,
+    "warning_high_cpu":        false       // true if cpu_fraction_one_core > 0.25
+  },
+  "quantiles_ms": {
+    "csv":   { "p50": 142.3, "p95": 388.1, "p99": 612.7 },
+    "sut":   { "p50": 138.0, "p95": 380.0, "p99": 600.0,
+               "source": "histogram_diff" },   // or "skipped" with reason field
+    "delta": { "p50":   4.3, "p95":   8.1, "p99":  12.7 }
+  }
+}
+```
+
+Mode-specific fields are always present in `run` for stable parsing: exactly one of `target_rps` or `concurrency` is a number, and the other is `null`.
+
+Both `peak_inflight` and `max_inflight_reached_count` are useful even though the CSV records `dropped_offered`: `peak_inflight` shows whether the cap was approached (a saturation signal) without needing to drop, and `max_inflight_reached_count` makes the dropped-offered total visible at a glance without re-aggregating the CSV.
+
+`quantiles_ms.delta` is `csv − sut` per quantile. A negative delta is a bug somewhere (CSV measures from issue, which is strictly earlier than the SUT's `ttfc_observed_at`); flag and continue.
 
 ### 3.5 Chart renderer
 
@@ -259,7 +317,7 @@ samply load perf/runs/profile.json.gz   # opens Firefox profiler
 
 This is tooling, not product code. Test surface is small:
 
-1. **stress.py smoke test**: a 5-second 10 rps run against the mock backend at calm mode. Asserts CSV row count is between 40 and 60, success rate >95%, and that `<name>.summary.json` exists with both CSV-derived and SUT-derived quantiles populated. Skips the SUT-quantile assertion if `/metrics` is unreachable (logging a clear skip message rather than failing — keeps the test useful when run without a live multiplexer).
+1. **stress.py smoke test**: a 5-second 10 rps run against the mock backend at calm mode. Asserts CSV row count is between 30 and 70 (intentionally loose because open-loop arrivals are Poisson), success rate >95%, and that `<name>.summary.json` exists with both CSV-derived and SUT-derived quantiles populated. Skips the SUT-quantile assertion if `/metrics` is unreachable (logging a clear skip message rather than failing — keeps the test useful when run without a live multiplexer).
 2. **plot_latency.py smoke test**: feed it a synthetic CSV (10 known rows), assert all four PNGs are produced and non-empty.
 3. **profile.sh smoke test**: not automated — manual verification once.
 
@@ -275,7 +333,11 @@ Sufficient for: A/B comparisons (e.g., before/after the connection-pool refactor
 
 **Phase 2 (separate spec, deferred): Rust load gen for absolute-ceiling measurements.** Tokio + tungstenite, ~300 lines, same CSV + summary-JSON schema as Phase 1's `stress.py` so `plot_latency.py` is unchanged. Replaces (does not augment) the Python tool for ceiling work.
 
-**Phase 2 trigger.** If at any tested load the SUT-side `mux_ttfc_seconds` p99 (from `/metrics`) and the CSV-derived p99 from `stress.py` diverge by **more than 10 ms or 20% of SUT p99 (whichever is larger)**, Python has hit its ceiling and absolute-ceiling claims are no longer trustworthy from Phase 1. The `<name>.summary.json` sidecar from Phase 1's cross-check makes this trigger observable rather than guessed; we promise to act on it rather than rationalise past it.
+**Phase 2 trigger.** Compare the CSV-vs-SUT p99 delta at a low-rate baseline run (e.g., 10 rps × 30 s) against the same delta at the highest tested rate. If the **growth** in delta exceeds **10 ms or 20% of SUT p99 (whichever is larger)**, Python has hit its ceiling and absolute-ceiling claims are no longer trustworthy from Phase 1.
+
+The trigger is on growth, not absolute delta, because the delta has a non-zero floor even with a hypothetically zero-overhead load gen: kernel/loopback overhead, WS framing on both sides, and the SUT-side histogram-bucket quantisation (§3.3 cross-check) typically account for a few milliseconds. Those terms are roughly load-independent. The Python-overhead term, in contrast, scales with concurrent task count and event-loop pressure — that's the term that grows when you've found the ceiling.
+
+The `<name>.summary.json` sidecar makes this trigger observable rather than guessed; we promise to act on it rather than rationalise past it.
 
 **Future work, not phased** (out of scope for both phases above; each deserves its own design pass):
 - `pprof-rs` HTTP endpoint behind a `profiling` cargo feature, for in-process trigger during long-running prod-shaped runs without restart.
