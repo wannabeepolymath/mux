@@ -95,3 +95,52 @@ def parse_histogram(metrics_text: str, metric_name: str) -> Histogram:
 
     buckets = sorted(bucket_totals.items())
     return Histogram(buckets=buckets, count=total_count, sum=total_sum)
+
+
+class CounterResetError(Exception):
+    """Raised when a histogram diff detects a counter reset (start > end somewhere).
+
+    Typical cause: the multiplexer was restarted mid-run, or `/metrics` was
+    scraped from a different process between snapshots. Per spec §3.3, the run
+    still completes but SUT-side quantiles are marked `skipped` with
+    `reason="counter_reset_or_restart"`.
+    """
+
+
+def diff_histograms(start: Histogram, end: Histogram) -> Histogram:
+    """Compute end − start, returning a histogram of observations in the interval.
+
+    Raises CounterResetError if any bucket count, the total count, or the sum
+    decreased between start and end (a sign the underlying counter was reset).
+    Raises ValueError if bucket boundaries differ between snapshots.
+    """
+    if end.count < start.count:
+        raise CounterResetError(
+            f"_count decreased: start={start.count} end={end.count}"
+        )
+    if end.sum < start.sum:
+        raise CounterResetError(
+            f"_sum decreased: start={start.sum} end={end.sum}"
+        )
+    if len(start.buckets) != len(end.buckets):
+        raise ValueError(
+            f"bucket count mismatch: start={len(start.buckets)} end={len(end.buckets)}"
+        )
+
+    diff_buckets: list[tuple[float, int]] = []
+    for (le_s, c_s), (le_e, c_e) in zip(start.buckets, end.buckets):
+        if le_s != le_e:
+            raise ValueError(
+                f"bucket boundaries differ: start le={le_s} end le={le_e}"
+            )
+        if c_e < c_s:
+            raise CounterResetError(
+                f"bucket le={le_e} decreased: start={c_s} end={c_e}"
+            )
+        diff_buckets.append((le_e, c_e - c_s))
+
+    return Histogram(
+        buckets=diff_buckets,
+        count=end.count - start.count,
+        sum=end.sum - start.sum,
+    )
