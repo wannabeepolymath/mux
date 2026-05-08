@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -200,7 +200,6 @@ async def run_request(url: str, req_id: int, csv_writer: CsvRowWriter,
 # ---------------------------------------------------------------------------
 
 _METRIC_NAME = "mux_ttfc_seconds"
-_QUANTILES = (0.50, 0.95, 0.99)
 
 
 def _setup_uvloop_if_available() -> str:
