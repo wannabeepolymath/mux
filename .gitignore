@@ -4,3 +4,7 @@ Cargo.lock
 # Perf harness outputs
 perf/runs/*
 !perf/runs/.gitkeep
+
+# Python bytecode caches
+__pycache__/
+*.pyc

@@ -22,7 +22,7 @@ Design spec: `docs/superpowers/specs/2026-05-06-perf-harness-design.md`.
   ```bash
   pip install websockets matplotlib numpy
   pip install uvloop  # optional but recommended (Linux/macOS, ~2-3x speedup)
-  pip install psutil  # optional, enables SUT-CPU reporting
+  pip install psutil  # reserved for future SUT-process CPU reporting (not yet wired up)
   ```
 
 ## Quick start: comparison run
