@@ -19,7 +19,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 
-_DEFAULT_QUANTILES = (0.50, 0.95, 0.99)
 _LATENCY_WINDOW_MS_DEFAULT = 5000
 _RATE_WINDOW_MS_DEFAULT = 1000
 
@@ -114,6 +113,19 @@ def plot_latency_over_time(data, out_path: Path, window_ms: int, quantiles):
     ax2.grid(True, which="both", alpha=0.3)
     ax1.legend(loc="upper right")
     ax2.legend(loc="upper right")
+
+    # Spec §3.5: shade windows where success rate < 95% on both subplots.
+    all_centers, status_counts = _windowed_counts_by_status(data["ts"], data["status"], window_ms=window_ms)
+    if all_centers.size > 0:
+        succ = status_counts.get("success", np.zeros_like(all_centers))
+        total = sum(status_counts.get(s, np.zeros_like(all_centers))
+                    for s in ("success", "error", "timeout", "dropped_offered"))
+        half_w_s = (window_ms / 2) / 1000.0
+        for i, c in enumerate(all_centers):
+            if total[i] > 0 and (succ[i] / total[i]) < 0.95:
+                ax1.axvspan(c - half_w_s, c + half_w_s, alpha=0.15, color="red")
+                ax2.axvspan(c - half_w_s, c + half_w_s, alpha=0.15, color="red")
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
