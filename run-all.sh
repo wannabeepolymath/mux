@@ -44,18 +44,46 @@ for ((i=0; i<WORKERS; i++)); do
     BACKENDS+="${BACKENDS:+,}127.0.0.1:${p}"
 done
 
-PY="${PYTHON:-python3}"
 ASSIGN="$ROOT/assignment"
 MUX_BIN="$ROOT/target/release/tts-multiplexer"
 MUX_URL="ws://localhost:${MUX_PORT}/v1/ws/speech"
 
 # --- Pre-flight ---
 command -v cargo >/dev/null || { echo "cargo not found"; exit 1; }
-command -v "$PY" >/dev/null || { echo "$PY not found"; exit 1; }
-"$PY" -c "import websockets" 2>/dev/null || {
-    echo "Installing websockets..."
-    "$PY" -m pip install -q -r "$ASSIGN/requirements.txt"
+
+# Pick a Python that (a) actually runs and (b) has the websockets module.
+# Skips broken interpreters (e.g. Homebrew 3.14 with the pyexpat ABI break).
+pick_python() {
+    local candidates=()
+    [[ -n "${PYTHON:-}" ]] && candidates+=("$PYTHON")
+    candidates+=(python3 python3.13 python3.12 python3.11 python3.10 /usr/bin/python3)
+    local p
+    # First pass: prefer one that already has websockets installed.
+    for p in "${candidates[@]}"; do
+        command -v "$p" >/dev/null 2>&1 || continue
+        if "$p" -c "import websockets" >/dev/null 2>&1; then
+            echo "$p"; return 0
+        fi
+    done
+    # Second pass: any interpreter that at least imports stdlib cleanly.
+    for p in "${candidates[@]}"; do
+        command -v "$p" >/dev/null 2>&1 || continue
+        if "$p" -c "import sys, xml.parsers.expat" >/dev/null 2>&1; then
+            echo "$p"; return 0
+        fi
+    done
+    return 1
 }
+
+PY=$(pick_python) || { echo "No working Python 3 with websockets found. Install: pip install websockets"; exit 1; }
+echo ">> Using Python: $PY"
+
+if ! "$PY" -c "import websockets" 2>/dev/null; then
+    echo ">> Installing websockets into $PY..."
+    "$PY" -m pip install -q -r "$ASSIGN/requirements.txt" || {
+        echo "pip install failed under $PY. Try: $PY -m pip install websockets"; exit 1;
+    }
+fi
 
 echo ">> Building multiplexer (release)..."
 (cd "$ROOT" && cargo build --release -p tts-multiplexer)
@@ -76,7 +104,7 @@ run_inline() {
     mkdir -p "$logdir"
     echo ">> Starting backend (logs: $logdir/backend.log)"
     "$PY" "$ASSIGN/mock_backend.py" --workers "$WORKERS" --base-port "$BASE_PORT" \
-        "${BACKEND_FLAGS[@]}" >"$logdir/backend.log" 2>&1 &
+        ${BACKEND_FLAGS[@]+"${BACKEND_FLAGS[@]}"} >"$logdir/backend.log" 2>&1 &
     BACK_PID=$!
     trap 'echo ">> Cleaning up"; kill $BACK_PID ${MUX_PID:-} 2>/dev/null || true' EXIT
 
@@ -90,7 +118,7 @@ run_inline() {
     wait_port 127.0.0.1 "$MUX_PORT" 15
 
     echo ">> Running tests"
-    "$PY" "$ASSIGN/test_client.py" "$MUX_URL" "${TEST_FLAGS[@]}"
+    "$PY" "$ASSIGN/test_client.py" "$MUX_URL" ${TEST_FLAGS[@]+"${TEST_FLAGS[@]}"}
 }
 
 run_tmux() {
@@ -98,9 +126,9 @@ run_tmux() {
     tmux has-session -t "$SESSION" 2>/dev/null && tmux kill-session -t "$SESSION"
 
     local back_cmd mux_cmd test_cmd
-    back_cmd="$PY '$ASSIGN/mock_backend.py' --workers $WORKERS --base-port $BASE_PORT ${BACKEND_FLAGS[*]}"
+    back_cmd="$PY '$ASSIGN/mock_backend.py' --workers $WORKERS --base-port $BASE_PORT ${BACKEND_FLAGS[*]:-}"
     mux_cmd="bash -c \"for p in $(seq $BASE_PORT $((BASE_PORT+WORKERS-1))); do until (echo >/dev/tcp/127.0.0.1/\$p) 2>/dev/null; do sleep 0.2; done; done; '$MUX_BIN' --port $MUX_PORT --metrics-port $METRICS_PORT --backends $BACKENDS\""
-    test_cmd="bash -c \"until (echo >/dev/tcp/127.0.0.1/$MUX_PORT) 2>/dev/null; do sleep 0.2; done; sleep 0.5; $PY '$ASSIGN/test_client.py' '$MUX_URL' ${TEST_FLAGS[*]}; echo; echo '[tests done — Ctrl-b d to detach, or: tmux kill-session -t $SESSION]'; exec bash\""
+    test_cmd="bash -c \"until (echo >/dev/tcp/127.0.0.1/$MUX_PORT) 2>/dev/null; do sleep 0.2; done; sleep 0.5; $PY '$ASSIGN/test_client.py' '$MUX_URL' ${TEST_FLAGS[*]:-}; echo; echo '[tests done — Ctrl-b d to detach, or: tmux kill-session -t $SESSION]'; exec bash\""
 
     tmux new-session  -d -s "$SESSION" -n backend "$back_cmd"
     tmux split-window -t "$SESSION:0" -v "$mux_cmd"

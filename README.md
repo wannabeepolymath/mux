@@ -10,12 +10,33 @@ This repo contains:
 
 - Rust (latest stable) + Cargo
 - Python 3.10+ (3.11+ recommended)
+- `tmux` (optional, only for the one-command runner below)
 
 Python dependency:
 
 ```bash
 python -m pip install --upgrade websockets>=13.0
 ```
+
+## Quick start (one command)
+
+`run-all.sh` builds the multiplexer, starts the 8 mock backends, starts the
+multiplexer, and runs the test client — each in its own tmux pane so logs stay
+separated and you can detach without killing anything.
+
+```bash
+./run-all.sh                # chaos backends + correctness tests
+./run-all.sh --calm         # backends without chaos
+./run-all.sh --all          # full test suite
+./run-all.sh -- --soak 120  # forward anything after `--` to test_client.py
+./run-all.sh --no-tmux      # background procs + foreground tests, logs in .run-logs/
+```
+
+Inside tmux: detach with `Ctrl-b d`, reattach with `tmux attach -t tts-mux`,
+kill with `tmux kill-session -t tts-mux`. The script waits for each port to
+open before starting the next stage (no fixed sleeps).
+
+If you'd rather run each piece by hand, the sections below cover that.
 
 ## Build
 
