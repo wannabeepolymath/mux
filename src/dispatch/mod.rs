@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::circuit::CircuitState;
 use crate::backend::connection::BackendConn;
 use crate::backend::state::BackendState;
+use crate::client::router::ClientChannel;
 use crate::config::Config;
 use crate::forward::{self, ForwardOutcome, ForwardResult};
 use crate::health::{BackendHealth, HealthSnapshot};
@@ -52,7 +52,7 @@ pub struct PendingRequest {
     pub stream_id: StreamId,
     pub text: String,
     pub speaker_id: u32,
-    pub client_tx: mpsc::Sender<ClientEvent>,
+    pub channel: ClientChannel,
     pub retries_remaining: u32,
     pub created_at: Instant,
     /// Shared counter for active streams on the client connection.
@@ -66,15 +66,6 @@ impl HasStreamId for PendingRequest {
     fn stream_id(&self) -> &StreamId {
         &self.stream_id
     }
-}
-
-// ── Events sent FROM Dispatcher/forward TO client writer ────────────────
-
-pub enum ClientEvent {
-    /// JSON text frame to send to the client.
-    Text(String),
-    /// Pre-encoded binary frame (stream_id header + PCM payload).
-    Binary(Bytes),
 }
 
 // ── Dispatcher actor ────────────────────────────────────────────────────
@@ -174,7 +165,7 @@ impl Dispatcher {
                 stream_id: req.stream_id.0.clone(),
                 message: "Missing 'text' field".into(),
             };
-            let _ = req.client_tx.try_send(ClientEvent::Text(err.to_json()));
+            req.channel.push_terminal(&req.stream_id, err.to_json());
             return;
         }
 
@@ -184,7 +175,7 @@ impl Dispatcher {
             stream_id: req.stream_id.0.clone(),
             queue_depth,
         };
-        let _ = req.client_tx.try_send(ClientEvent::Text(ack.to_json()));
+        req.channel.push_text(ack.to_json());
 
         if let Err(req) = self.queue.push_back(req) {
             req.active_count.fetch_sub(1, Ordering::Relaxed);
@@ -200,7 +191,7 @@ impl Dispatcher {
                     self.config.max_queue_depth
                 ),
             };
-            let _ = req.client_tx.try_send(ClientEvent::Text(err.to_json()));
+            req.channel.push_terminal(&req.stream_id, err.to_json());
             return;
         }
 
@@ -254,9 +245,9 @@ impl Dispatcher {
                     total_time: round_2(total_time),
                     rtf: round_2(rtf),
                 };
-                let _ = result
-                    .client_tx
-                    .try_send(ClientEvent::Text(done.to_json()));
+                result
+                    .channel
+                    .push_terminal(&result.stream_id, done.to_json());
 
                 tracing::debug!(
                     stream = %result.stream_id,
@@ -293,7 +284,7 @@ impl Dispatcher {
                     stream_id: result.stream_id,
                     text: result.text,
                     speaker_id: result.speaker_id,
-                    client_tx: result.client_tx,
+                    channel: result.channel,
                     retries_remaining: result.retries_remaining,
                     created_at: result.created_at,
                     active_count: result.active_count,
@@ -359,7 +350,7 @@ impl Dispatcher {
                         stream_id: result.stream_id,
                         text: result.text,
                         speaker_id: result.speaker_id,
-                        client_tx: result.client_tx,
+                        channel: result.channel,
                         retries_remaining: result.retries_remaining - 1,
                         created_at: result.created_at,
                         active_count: result.active_count,
@@ -380,9 +371,9 @@ impl Dispatcher {
                             self.config.max_retries
                         ),
                     };
-                    let _ = result
-                        .client_tx
-                        .try_send(ClientEvent::Text(err.to_json()));
+                    result
+                        .channel
+                        .push_terminal(&result.stream_id, err.to_json());
                 }
 
                 if circuit_just_opened {

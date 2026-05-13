@@ -50,6 +50,10 @@ pub struct CliArgs {
     /// Connect timeout in seconds for backend WebSocket handshake.
     #[arg(long, default_value = "3")]
     pub connect_timeout_secs: u64,
+
+    /// Per-stream client-egress buffer size in bytes (drop-oldest at cap).
+    #[arg(long, default_value = "262144")]
+    pub client_buffer_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +69,7 @@ pub struct Config {
     pub max_retries: u32,
     pub drain_timeout: Duration,
     pub connect_timeout: Duration,
+    pub client_buffer_bytes: usize,
 }
 
 impl Config {
@@ -90,6 +95,7 @@ impl Config {
             max_retries: args.max_retries,
             drain_timeout: Duration::from_millis(args.drain_timeout_ms),
             connect_timeout: Duration::from_secs(args.connect_timeout_secs),
+            client_buffer_bytes: args.client_buffer_bytes,
         })
     }
 }

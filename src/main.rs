@@ -51,6 +51,7 @@ async fn main() {
     tracing::info!("  max_retries: {}", config.max_retries);
     tracing::info!("  max_queue_depth: {}", config.max_queue_depth);
     tracing::info!("  max_streams_per_conn: {}", config.max_streams_per_conn);
+    tracing::info!("  client_buffer_bytes: {}", config.client_buffer_bytes);
 
     let config = Arc::new(config);
 

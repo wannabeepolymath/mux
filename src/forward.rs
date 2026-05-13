@@ -3,11 +3,12 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::backend::BackendWs;
-use crate::dispatch::{ClientEvent, PendingRequest};
+use crate::client::router::ClientChannel;
+use crate::dispatch::PendingRequest;
 use crate::metrics::Metrics;
 use crate::protocol::backend::BackendMessage;
 use crate::protocol::frame::encode_binary_frame;
@@ -35,7 +36,7 @@ pub struct ForwardResult {
     pub backend_id: BackendId,
     pub stream_id: StreamId,
     pub outcome: ForwardOutcome,
-    pub client_tx: mpsc::Sender<ClientEvent>,
+    pub channel: ClientChannel,
     pub text: String,
     pub speaker_id: u32,
     pub retries_remaining: u32,
@@ -64,7 +65,7 @@ pub async fn run_forwarding(
         &stream_id,
         &request.text,
         request.speaker_id,
-        &request.client_tx,
+        &request.channel,
         hang_timeout,
         drain_timeout,
         cancel_rx,
@@ -81,7 +82,7 @@ pub async fn run_forwarding(
         backend_id,
         stream_id,
         outcome,
-        client_tx: request.client_tx,
+        channel: request.channel,
         text: request.text,
         speaker_id: request.speaker_id,
         retries_remaining: request.retries_remaining,
@@ -97,7 +98,7 @@ async fn do_forward(
     stream_id: &StreamId,
     text: &str,
     speaker_id: u32,
-    client_tx: &mpsc::Sender<ClientEvent>,
+    channel: &ClientChannel,
     hang_timeout: Duration,
     drain_timeout: Duration,
     mut cancel_rx: oneshot::Receiver<()>,
@@ -161,25 +162,20 @@ async fn do_forward(
                             if first_chunk_time.is_none() {
                                 first_chunk_time = Some(Instant::now());
                             }
-
+                            // Cancel check first — non-blocking, no yield.
+                            if cancel_rx.try_recv().is_ok() {
+                                active_close(ws, drain_timeout).await;
+                                return ForwardOutcome::Cancelled;
+                            }
+                            // Client-gone check.
+                            if channel.is_closed() {
+                                active_close(ws, drain_timeout).await;
+                                return ForwardOutcome::ClientGone;
+                            }
                             let chunk_start = Instant::now();
                             let tagged = encode_binary_frame(&stream_id.0, &data);
-                            tokio::select! {
-                                biased;
-                                _ = &mut cancel_rx => {
-                                    active_close(ws, drain_timeout).await;
-                                    return ForwardOutcome::Cancelled;
-                                }
-                                send = client_tx.send(ClientEvent::Binary(tagged)) => {
-                                    if send.is_err() {
-                                        // Client gone: backend keeps producing. Drain briefly
-                                        // and drop. Active-close cost on this path is acceptable
-                                        // (rare).
-                                        active_close(ws, drain_timeout).await;
-                                        return ForwardOutcome::ClientGone;
-                                    }
-                                }
-                            }
+                            // Non-blocking push; drop-oldest applied inside the buffer.
+                            channel.push_chunk(stream_id, tagged);
                             metrics
                                 .chunk_forward_seconds
                                 .observe(chunk_start.elapsed().as_secs_f64());

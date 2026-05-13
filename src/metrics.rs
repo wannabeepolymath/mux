@@ -1,5 +1,5 @@
 use prometheus::{
-    Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 
 /// All Prometheus metrics exposed by the multiplexer.
@@ -29,6 +29,10 @@ pub struct Metrics {
 
     /// Number of connected client WebSocket sessions.
     pub active_connections: IntGauge,
+
+    /// Lifetime count of audio chunks dropped due to per-stream backpressure
+    /// (slow consumer + buffer at cap).
+    pub backpressure_drops_total: IntCounter,
 }
 
 /// All states a backend can be in. The metrics endpoint emits a gauge for each
@@ -95,6 +99,12 @@ impl Metrics {
         ))?;
         registry.register(Box::new(active_connections.clone()))?;
 
+        let backpressure_drops_total = IntCounter::with_opts(Opts::new(
+            "mux_backpressure_drops_total",
+            "Audio chunks dropped due to per-stream backpressure (slow consumer)",
+        ))?;
+        registry.register(Box::new(backpressure_drops_total.clone()))?;
+
         Ok(Self {
             registry,
             requests_total,
@@ -104,6 +114,7 @@ impl Metrics {
             active_streams,
             backend_state,
             active_connections,
+            backpressure_drops_total,
         })
     }
 

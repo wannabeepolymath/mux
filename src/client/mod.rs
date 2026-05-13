@@ -1,3 +1,6 @@
+mod buffer;
+pub mod router;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -9,10 +12,12 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::Config;
-use crate::dispatch::{ClientEvent, DispatchEvent, PendingRequest};
+use crate::dispatch::{DispatchEvent, PendingRequest};
 use crate::metrics::Metrics;
 use crate::protocol::client::ClientMessage;
 use crate::types::StreamId;
+
+use router::{BinaryRouter, ClientChannel, WriteWork};
 
 /// Handle a single client WebSocket connection.
 pub async fn handle_client(
@@ -24,10 +29,11 @@ pub async fn handle_client(
 ) {
     metrics.active_connections.inc();
     let (ws_sink, mut ws_stream) = ws.split();
-    // Large enough for many concurrent streams × chunks without try_send loss.
-    let (client_tx, client_rx) = mpsc::channel::<ClientEvent>(4096);
 
-    let writer_handle = tokio::spawn(client_writer(ws_sink, client_rx));
+    let router = BinaryRouter::new(config.client_buffer_bytes);
+    let channel = ClientChannel::new(router.clone(), metrics.clone());
+
+    let writer_handle = tokio::spawn(client_writer(ws_sink, router.clone()));
 
     tracing::debug!(client = %client_addr, "client connected");
 
@@ -53,7 +59,7 @@ pub async fn handle_client(
                             "stream_id": "",
                             "message": format!("invalid message: {e}"),
                         });
-                        let _ = client_tx.try_send(ClientEvent::Text(err_json.to_string()));
+                        channel.push_text(err_json.to_string());
                         continue;
                     }
                 };
@@ -74,8 +80,7 @@ pub async fn handle_client(
                                     config.max_streams_per_conn
                                 ),
                             });
-                            let _ =
-                                client_tx.try_send(ClientEvent::Text(err_json.to_string()));
+                            channel.push_text(err_json.to_string());
                             continue;
                         }
 
@@ -85,7 +90,7 @@ pub async fn handle_client(
                             stream_id: StreamId(stream_id),
                             text,
                             speaker_id,
-                            client_tx: client_tx.clone(),
+                            channel: channel.clone(),
                             retries_remaining: config.max_retries,
                             created_at: Instant::now(),
                             active_count: active_count.clone(),
@@ -124,25 +129,27 @@ pub async fn handle_client(
         }
     }
 
-    drop(client_tx);
+    router.close();
     let _ = writer_handle.await;
     metrics.active_connections.dec();
     tracing::debug!(client = %client_addr, "client handler finished");
 }
 
-/// Dedicated writer task: reads ClientEvents and sends them over the WebSocket.
+/// Dedicated writer task: drains the BinaryRouter and writes frames to the WS.
 async fn client_writer(
     mut sink: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
-    mut rx: mpsc::Receiver<ClientEvent>,
+    router: Arc<BinaryRouter>,
 ) {
-    while let Some(event) = rx.recv().await {
-        let msg = match event {
-            ClientEvent::Text(text) => Message::Text(text.into()),
-            ClientEvent::Binary(data) => Message::Binary(data),
+    while let Some(work) = router.next_work().await {
+        let msg = match work {
+            WriteWork::Text(t) => Message::Text(t.into()),
+            WriteWork::Chunk(b) => Message::Binary(b),
+            WriteWork::Terminal(t) => Message::Text(t.into()),
         };
 
         if let Err(e) = sink.send(msg).await {
             tracing::debug!("client write error: {e}");
+            router.close();
             break;
         }
     }
